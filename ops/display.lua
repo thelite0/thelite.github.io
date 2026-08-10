@@ -138,8 +138,36 @@ local function txt(x, y, s, color, size)
   pcall(gpu.drawText, x, y, tostring(s), color or C.text, 0x00000000, size or 1)
 end
 
+-- Lua's # operator counts UTF-8 bytes, not visible characters. The UI is
+-- Russian, so centering and truncation need simple UTF-8-aware helpers.
+local function utf8Len(s)
+  s = tostring(s or "")
+  local n = 0
+  for i = 1, #s do
+    local b = s:byte(i)
+    if b < 0x80 or b >= 0xC0 then n = n + 1 end
+  end
+  return n
+end
+
+local function utf8Sub(s, first, last)
+  s = tostring(s or "")
+  local starts = {}
+  for i = 1, #s do
+    local b = s:byte(i)
+    if b < 0x80 or b >= 0xC0 then starts[#starts + 1] = i end
+  end
+  if #starts == 0 then return "" end
+  first = math.max(1, first or 1)
+  last = math.min(#starts, last or #starts)
+  if first > last then return "" end
+  local a = starts[first]
+  local b = last < #starts and (starts[last + 1] - 1) or #s
+  return s:sub(a, b)
+end
+
 local function textWidth(s, size)
-  return #tostring(s) * 6 * (size or 1)
+  return utf8Len(s) * 6 * (size or 1)
 end
 
 local function txtCentered(y, s, color, size, x, w)
@@ -149,9 +177,23 @@ local function txtCentered(y, s, color, size, x, w)
 end
 
 local function short(s, n)
-  s = tostring(s or "UNKNOWN")
-  if #s <= n then return s end
-  return s:sub(1, math.max(1, n - 3)) .. "..."
+  s = tostring(s or "НЕИЗВ.")
+  if utf8Len(s) <= n then return s end
+  return utf8Sub(s, 1, math.max(1, n - 3)) .. "..."
+end
+
+local function stateText(s)
+  local m = {
+    CONTACT = "КОНТАКТ",
+    WATCH = "НАБЛЮД.",
+    INBOUND = "СБЛИЖ.",
+    HIGH = "УГРОЗА",
+    CRIT = "КРИТ.",
+    PERSON = "ИГРОК",
+    ["FAST IN"] = "БЫСТР. ВХОД",
+    TRACK = "ЦЕЛЬ",
+  }
+  return m[s] or tostring(s or "ЦЕЛЬ")
 end
 
 local function hazardRail(x, y, w, h)
@@ -265,13 +307,13 @@ end
 
 local function scanSubs(now)
   if not subSensor then
-    lastSubError = "sensor missing"
+    lastSubError = "НЕТ ДАТЧИКА"
     return {}
   end
 
   local ok, raw = pcall(function() return subSensor.scanForSubLevels(CONTRAPTION_RANGE) end)
   if not ok or type(raw) ~= "table" then
-    lastSubError = ok and "bad response" or tostring(raw)
+    lastSubError = ok and "ОШИБКА ОТВЕТА" or tostring(raw)
     return {}
   end
 
@@ -293,7 +335,7 @@ local function scanSubs(now)
     local row = {
       kind = "sub",
       key = key,
-      name = v.name or "CONTRAP",
+      name = v.name or "АППАРАТ",
       x = sample.x, y = sample.y, z = sample.z, d = sample.d,
       closing = closing,
       speed = totalSpeed(tr.history),
@@ -320,13 +362,13 @@ end
 
 local function scanPeople(now)
   if not personSensor then
-    lastPersonError = "sensor missing"
+    lastPersonError = "НЕТ ДАТЧИКА"
     return {}
   end
 
   local ok, raw = pcall(function() return personSensor.scanForPlayers(PERSON_RANGE) end)
   if not ok or type(raw) ~= "table" then
-    lastPersonError = ok and "bad response" or tostring(raw)
+    lastPersonError = ok and "ОШИБКА ОТВЕТА" or tostring(raw)
     return {}
   end
 
@@ -353,7 +395,7 @@ local function scanPeople(now)
     rows[#rows + 1] = {
       kind = "person",
       key = key,
-      name = v.username or "UNKNOWN",
+      name = v.username or "НЕИЗВ.",
       x = lx, y = ly, z = lz, d = d,
       worldX = v.x, worldY = v.y, worldZ = v.z,
       health = v.health, maxHealth = v.maxHealth,
@@ -459,21 +501,21 @@ local function summarize(subs, people)
   local combined = fastPerson and inboundSub
 
   if critSub then
-    return "CRITICAL", "IMMEDIATE CONTRAPTION THREAT", C.magenta, C.critical, true, 5, critSub
+    return "КРИТИЧНО", "КРИТИЧЕСКАЯ УГРОЗА", C.magenta, C.critical, true, 5, critSub
   elseif combined then
-    return "ALARM", "PERSON + CONTRAPTION APPROACH", C.red, C.alertBg, true, 4, inboundSub
+    return "ТРЕВОГА", "ИГРОК + АППАРАТ СБЛИЖАЮТСЯ", C.red, C.alertBg, true, 4, inboundSub
   elseif severeSub then
-    return "HIGH", "CONTRAPTION THREAT", C.red, C.alertBg, true, 4, severeSub
+    return "УГРОЗА", "ОПАСНЫЙ АППАРАТ", C.red, C.alertBg, true, 4, severeSub
   elseif inboundSub then
-    return "INBOUND", "CONTRAPTION APPROACHING", C.orange, C.alertBg, true, 3, inboundSub
+    return "СБЛИЖЕНИЕ", "АППАРАТ ПРИБЛИЖАЕТСЯ", C.orange, C.alertBg, true, 3, inboundSub
   elseif fastPerson then
-    return "WARNING", "FAST PERSON APPROACHING", C.orange, C.watchBg, false, 2, fastPerson
+    return "ВНИМАНИЕ", "БЫСТРЫЙ ИГРОК ПРИБЛИЖАЕТСЯ", C.orange, C.watchBg, false, 2, fastPerson
   elseif topSub and topSub.rank == 1 then
-    return "WATCH", "CONTRAPTION IN WATCH SECTOR", C.yellow, C.watchBg, false, 1, topSub
+    return "НАБЛЮД.", "АППАРАТ В СЕКТОРЕ НАБЛЮДЕНИЯ", C.yellow, C.watchBg, false, 1, topSub
   elseif #subs > 0 or #people > 0 then
-    return "CONTACT", tostring(#people) .. " PERSON / " .. tostring(#subs) .. " CONTRAP", C.cyan, C.infoBg, false, 0, topSub or people[1]
+    return "КОНТАКТ", "ИГРОКИ " .. tostring(#people) .. " / АППАРАТЫ " .. tostring(#subs), C.cyan, C.infoBg, false, 0, topSub or people[1]
   else
-    return "CLEAR", "NO DETECTIONS", C.green, C.clearBg, false, 0, nil
+    return "ЧИСТО", "КОНТАКТОВ НЕТ", C.green, C.clearBg, false, 0, nil
   end
 end
 
@@ -575,7 +617,7 @@ end
 local function drawCoverage(x, y, w, h, subs, people)
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
-  txt(x + 5, y + 4, "TACTICAL MAP", C.dim, 1)
+  txt(x + 5, y + 4, "ТАКТИЧЕСКАЯ КАРТА", C.dim, 1)
   txt(x + w - 48, y + 4, "+/-" .. tostring(mapRange), C.dim, 1)
 
   local mapX = x + 5
@@ -639,7 +681,7 @@ local function drawCoverage(x, y, w, h, subs, people)
         txt(lx, py - 3, short(r.name, 8), color, 1)
         line(cx, cy, px, py, C.dim)
       elseif (r.displayIndex or i) <= 9 then
-        local label = (r.kind == "person" and "P" or "C") .. tostring(r.displayIndex or i)
+        local label = (r.kind == "person" and "И" or "А") .. tostring(r.displayIndex or i)
         local lx = px + 4
         if lx + textWidth(label, 1) > mapX + mapW then lx = px - textWidth(label, 1) - 4 end
         txt(lx, py - 3, label, color, 1)
@@ -656,22 +698,22 @@ local function drawListPanel(x, y, w, h, subs, people)
 
   local selected = selectedRow(subs, people)
   if selected then
-    txt(x + 5, y + 4, selected.kind == "person" and "PLAYER" or "CONTRAP", C.text, 1)
-    drawButton("back", x + w - 27, y + 3, 22, 12, "BACK", false, C.cyan)
+    txt(x + 5, y + 4, selected.kind == "person" and "ИГРОК" or "АППАРАТ", C.text, 1)
+    drawButton("back", x + w - 34, y + 3, 29, 12, "НАЗАД", false, C.cyan)
 
     local color = selected.kind == "person" and (selected.warning and C.orange or C.blue) or subColor(selected)
     txt(x + 5, y + 20, short(selected.name, 10), color, 1)
-    txt(x + 5, y + 32, selected.state or "TRACK", color, 1)
-    txt(x + 5, y + 44, string.format("D %.0f", selected.d or 0), C.text, 1)
-    txt(x + 5, y + 55, string.format("S %.1f", selected.speed or 0), C.text, 1)
-    txt(x + 5, y + 66, string.format("C %+.1f", selected.closing or 0), (selected.closing or 0) > 1 and C.orange or C.dim, 1)
-    txt(x + 5, y + 77, selected.eta and string.format("E %.0fs", selected.eta) or "E --", C.text, 1)
-    txt(x + 5, y + 88, string.format("L%.0f/%.0f", selected.x or 0, selected.z or 0), C.dim, 1)
+    txt(x + 5, y + 32, stateText(selected.state), color, 1)
+    txt(x + 5, y + 44, string.format("Д %.0f", selected.d or 0), C.text, 1)
+    txt(x + 5, y + 55, string.format("СК %.1f", selected.speed or 0), C.text, 1)
+    txt(x + 5, y + 66, string.format("СБ %+.1f", selected.closing or 0), (selected.closing or 0) > 1 and C.orange or C.dim, 1)
+    txt(x + 5, y + 77, selected.eta and string.format("ETA %.0fs", selected.eta) or "ETA --", C.text, 1)
+    txt(x + 5, y + 88, string.format("Л%.0f/%.0f", selected.x or 0, selected.z or 0), C.dim, 1)
 
     if selected.kind == "person" then
-      if selected.worldX then txt(x + 5, y + 99, string.format("W%.0f/%.0f", selected.worldX, selected.worldZ), C.dim, 1) end
+      if selected.worldX then txt(x + 5, y + 99, string.format("М%.0f/%.0f", selected.worldX, selected.worldZ), C.dim, 1) end
     else
-      txt(x + 5, y + 99, selected.sector and "SEC YES" or "SEC NO", selected.sector and C.yellow or C.dim, 1)
+      txt(x + 5, y + 99, selected.sector and "СЕКТОР ДА" or "СЕКТОР НЕТ", selected.sector and C.yellow or C.dim, 1)
     end
     return
   end
@@ -680,15 +722,15 @@ local function drawListPanel(x, y, w, h, subs, people)
   local maxOffset = math.max(1, #rows - LIST_ROWS + 1)
   listOffset = clamp(listOffset, 1, maxOffset)
 
-  txt(x + 5, y + 4, "TRACKS " .. tostring(#rows), C.text, 1)
-  drawButton("list_up", x + w - 45, y + 3, 18, 12, "UP", false, C.cyan)
-  drawButton("list_down", x + w - 24, y + 3, 19, 12, "DN", false, C.cyan)
+  txt(x + 5, y + 4, "ЦЕЛИ " .. tostring(#rows), C.text, 1)
+  drawButton("list_up", x + w - 45, y + 3, 18, 12, "ВВ", false, C.cyan)
+  drawButton("list_down", x + w - 24, y + 3, 19, 12, "ВН", false, C.cyan)
 
   local yy = y + 20
   for i = listOffset, math.min(#rows, listOffset + LIST_ROWS - 1) do
     local r = rows[i]
     local color = r.kind == "person" and (r.warning and C.orange or C.blue) or subColor(r)
-    local prefix = r.kind == "person" and "P" or "C"
+    local prefix = r.kind == "person" and "И" or "А"
     txt(x + 4, yy, prefix .. tostring(r.displayIndex or i), color, 1)
     txt(x + 19, yy, short(r.name, 4), color, 1)
     txt(x + w - 22, yy, tostring(math.floor(r.d + 0.5)), C.dim, 1)
@@ -697,7 +739,7 @@ local function drawListPanel(x, y, w, h, subs, people)
   end
 
   if #rows == 0 then
-    txt(x + 5, y + 30, "NO TRACKS", C.green, 1)
+    txt(x + 5, y + 30, "ЦЕЛЕЙ НЕТ", C.green, 1)
   end
 end
 
@@ -711,12 +753,12 @@ local function drawHeader(status, message, color, bg, shouldSiren, physicalSiren
   txtCentered(y + 22, message, C.text, 1, x, w)
 
   if shouldSiren then
-    txt(x + 5, y + 22, physicalSiren and "SIREN" or "MUTED", physicalSiren and C.red or C.yellow, 1)
+    txt(x + 5, y + 22, physicalSiren and "СИРЕНА" or "ТИХО", physicalSiren and C.red or C.yellow, 1)
   elseif ackStatus == status then
-    txt(x + 5, y + 22, "ACK", C.green, 1)
+    txt(x + 5, y + 22, "ПРИН.", C.green, 1)
   end
 
-  if simScenario then txt(x + w - 30, y + 22, "SIM", C.yellow, 1) end
+  if simScenario then txt(x + w - 30, y + 22, "СИМ", C.yellow, 1) end
   addHit("header", x, y, w, h, focus and {kind=focus.kind, key=focus.key} or nil)
 end
 
@@ -737,44 +779,44 @@ local function drawSystem(subs, people, status, message, color, bg, shouldSiren,
   local x, y, w, h = 6, 46, W - 12, H - 82
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
-  txt(x + 6, y + 5, "SYSTEM STATUS", C.text, 1)
+  txt(x + 6, y + 5, "СОСТОЯНИЕ СИСТЕМЫ", C.text, 1)
 
   local sy = y + 18
-  txt(x + 6, sy, "DISPLAY", C.dim, 1)
+  txt(x + 6, sy, "ЭКРАН", C.dim, 1)
   txt(x + 62, sy, string.format("%dx%d  %s", W, H, short(gpuSide, 8)), C.green, 1)
   sy = sy + 12
-  txt(x + 6, sy, "CONTRAP", C.dim, 1)
-  txt(x + 62, sy, subSensor and "ONLINE" or "MISSING", subSensor and C.green or C.red, 1)
-  txt(x + 112, sy, lastSubError and short(lastSubError, 10) or "OK", lastSubError and C.red or C.dim, 1)
+  txt(x + 6, sy, "АППАРАТ", C.dim, 1)
+  txt(x + 62, sy, subSensor and "РАБОТА" or "НЕТ", subSensor and C.green or C.red, 1)
+  txt(x + 112, sy, lastSubError and short(lastSubError, 10) or "ОК", lastSubError and C.red or C.dim, 1)
   sy = sy + 12
-  txt(x + 6, sy, "PERSON", C.dim, 1)
-  txt(x + 62, sy, personSensor and "ONLINE" or "MISSING", personSensor and C.green or C.red, 1)
-  txt(x + 112, sy, lastPersonError and short(lastPersonError, 10) or "OK", lastPersonError and C.red or C.dim, 1)
+  txt(x + 6, sy, "ИГРОКИ", C.dim, 1)
+  txt(x + 62, sy, personSensor and "РАБОТА" or "НЕТ", personSensor and C.green or C.red, 1)
+  txt(x + 112, sy, lastPersonError and short(lastPersonError, 10) or "ОК", lastPersonError and C.red or C.dim, 1)
   sy = sy + 12
-  txt(x + 6, sy, "RANGES", C.dim, 1)
-  txt(x + 62, sy, "C2048 / P1024", C.text, 1)
+  txt(x + 6, sy, "ДАЛЬНОСТЬ", C.dim, 1)
+  txt(x + 62, sy, "А2048 / И1024", C.text, 1)
   sy = sy + 12
-  txt(x + 6, sy, "SCAN", C.dim, 1)
+  txt(x + 6, sy, "СКАН", C.dim, 1)
   txt(x + 62, sy, string.format("%.2fs", SCAN_INTERVAL), C.text, 1)
   sy = sy + 12
-  txt(x + 6, sy, "TRACKS", C.dim, 1)
-  txt(x + 62, sy, string.format("P%d C%d", #people, #subs), C.text, 1)
+  txt(x + 6, sy, "ЦЕЛИ", C.dim, 1)
+  txt(x + 62, sy, string.format("И%d А%d", #people, #subs), C.text, 1)
   sy = sy + 12
-  txt(x + 6, sy, "OUTPUT", C.dim, 1)
-  txt(x + 62, sy, physicalSiren and "SIREN ON" or "SIREN OFF", physicalSiren and C.red or C.green, 1)
+  txt(x + 6, sy, "ВЫХОД", C.dim, 1)
+  txt(x + 62, sy, physicalSiren and "СИРЕНА ВКЛ" or "СИРЕНА ВЫКЛ", physicalSiren and C.red or C.green, 1)
   sy = sy + 12
-  txt(x + 6, sy, "MUTE", C.dim, 1)
+  txt(x + 6, sy, "ТИШИНА", C.dim, 1)
   local remain = math.max(0, muteUntil - now)
-  txt(x + 62, sy, remain > 0 and string.format("%.0fs", remain) or "OFF", remain > 0 and C.yellow or C.green, 1)
+  txt(x + 62, sy, remain > 0 and string.format("%.0fs", remain) or "ВЫКЛ", remain > 0 and C.yellow or C.green, 1)
 end
 
 local TESTS = {
-  {id="sim_player", label="PLAYERS", scenario="PLAYER"},
-  {id="sim_fast", label="FAST P", scenario="FAST"},
-  {id="sim_contrap", label="CONTRAP", scenario="CONTRAP"},
-  {id="sim_inbound", label="INBOUND", scenario="INBOUND"},
-  {id="sim_combined", label="COMBINED", scenario="COMBINED"},
-  {id="sim_crit", label="CRITICAL", scenario="CRIT"},
+  {id="sim_player", label="ИГРОКИ", scenario="PLAYER"},
+  {id="sim_fast", label="БЫСТР.", scenario="FAST"},
+  {id="sim_contrap", label="АППАРАТ", scenario="CONTRAP"},
+  {id="sim_inbound", label="СБЛИЖ.", scenario="INBOUND"},
+  {id="sim_combined", label="ВМЕСТЕ", scenario="COMBINED"},
+  {id="sim_crit", label="КРИТИЧ.", scenario="CRIT"},
 }
 
 local function drawTest(subs, people, status, message, color, bg, shouldSiren, physicalSiren, severity, focus, now)
@@ -782,8 +824,8 @@ local function drawTest(subs, people, status, message, color, bg, shouldSiren, p
   local x, y, w, h = 6, 46, W - 12, H - 82
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
-  txt(x + 6, y + 5, "SIMULATION CONTROLS", C.text, 1)
-  txt(x + 6, y + 16, simScenario and ("ACTIVE: " .. simScenario) or "LIVE DATA ACTIVE", simScenario and C.yellow or C.green, 1)
+  txt(x + 6, y + 5, "УПРАВЛЕНИЕ СИМУЛЯЦИЕЙ", C.text, 1)
+  txt(x + 6, y + 16, simScenario and ("АКТИВНО: " .. simScenario) or "РЕАЛЬНЫЕ ДАННЫЕ", simScenario and C.yellow or C.green, 1)
 
   local bw, bh = 52, 22
   local startX, startY = x + 7, y + 34
@@ -795,10 +837,10 @@ local function drawTest(subs, people, status, message, color, bg, shouldSiren, p
     drawButton(t.id, bx, by, bw, bh, t.label, simScenario == t.scenario, C.yellow)
   end
 
-  drawButton("sim_stop", startX, startY + 62, 80, 18, "STOP SIM", simScenario == nil, C.green)
-  drawButton("sim_clear", startX + 86, startY + 62, 80, 18, "NO CONTACT", simScenario == "NONE", C.cyan)
+  drawButton("sim_stop", startX, startY + 62, 80, 18, "СТОП СИМ", simScenario == nil, C.green)
+  drawButton("sim_clear", startX + 86, startY + 62, 80, 18, "НЕТ ЦЕЛЕЙ", simScenario == "NONE", C.cyan)
 
-  txt(x + 7, y + 101, QUIET_TEST and "QUIET TEST: PHYSICAL SIREN DISABLED" or "TEST CAN DRIVE PHYSICAL SIREN", QUIET_TEST and C.yellow or C.dim, 1)
+  txt(x + 7, y + 101, QUIET_TEST and "ТИХИЙ ТЕСТ: СИРЕНА ОТКЛ." or "ТЕСТ МОЖЕТ ВКЛЮЧИТЬ СИРЕНУ", QUIET_TEST and C.yellow or C.dim, 1)
 end
 
 local function drawFooter(status, physicalSiren, now)
@@ -807,14 +849,14 @@ local function drawFooter(status, physicalSiren, now)
   outline(x, y, w, h, C.border)
 
   local labels = {
-    {id="filter_all", label="ALL", active=filter=="all"},
-    {id="filter_people", label="P", active=filter=="people"},
-    {id="filter_subs", label="C", active=filter=="subs"},
+    {id="filter_all", label="ВСЕ", active=filter=="all"},
+    {id="filter_people", label="ИГР", active=filter=="people"},
+    {id="filter_subs", label="АПП", active=filter=="subs"},
     {id="range", label=mapRange==CONTRAPTION_RANGE and "2K" or "1K", active=mapRange==PERSON_RANGE},
-    {id="sys", label="SYS", active=page=="sys"},
-    {id="test", label="TST", active=page=="test" or simScenario~=nil},
-    {id="ack", label="ACK", active=ackStatus==status},
-    {id="mute", label="MUT", active=muteUntil>now},
+    {id="sys", label="СИС", active=page=="sys"},
+    {id="test", label="ТСТ", active=page=="test" or simScenario~=nil},
+    {id="ack", label="ОК", active=ackStatus==status},
+    {id="mute", label="ТИХ", active=muteUntil>now},
   }
 
   local gap = 2
@@ -829,13 +871,13 @@ local function drawFooter(status, physicalSiren, now)
   if notice and noticeUntil > now then
     txtCentered(y + 17, notice, C.yellow, 1, x, w)
   else
-    local sir = physicalSiren and "SIREN ON" or (muteUntil > now and "SIREN MUTED" or "SIREN OFF")
+    local sir = physicalSiren and "СИРЕНА ВКЛ" or (muteUntil > now and "СИРЕНА ТИХО" or "СИРЕНА ВЫКЛ")
     txt(x + 4, y + 17, sir, physicalSiren and C.red or (muteUntil > now and C.yellow or C.dim), 1)
     txt(x + w - 47, y + 17, textutils.formatTime(os.time(), true), C.text, 1)
   end
 end
 
-local currentStatus = "CLEAR"
+local currentStatus = "ЧИСТО"
 local currentSeverity = 0
 local currentShouldSiren = false
 local currentPhysicalSiren = false
@@ -857,7 +899,7 @@ local function updateAlarm(now, status, shouldSiren, severity)
   if muteUntil > now and severity > muteSeverity then
     muteUntil = 0
     muteSeverity = 0
-    setNotice("MUTE OVERRIDDEN: HIGHER THREAT", 3)
+    setNotice("ТИШИНА СНЯТА: НОВАЯ УГРОЗА", 3)
   end
 
   local muted = muteUntil > now
@@ -938,29 +980,29 @@ local function handleClick(x, y, sneak)
         page = page == "test" and "main" or "test"
       elseif id == "ack" then
         ackStatus = currentStatus
-        setNotice("ALERT ACKNOWLEDGED", 2)
+        setNotice("ТРЕВОГА ПРИНЯТА", 2)
       elseif id == "mute" then
         if not sneak then
-          setNotice("SNEAK + CLICK MUT TO MUTE", 3)
+          setNotice("SHIFT + ТИХ ДЛЯ ОТКЛ. ЗВУКА", 3)
         elseif currentShouldSiren then
           muteUntil = now + MUTE_SECONDS
           muteSeverity = currentSeverity
-          setNotice("SIREN MUTED FOR " .. tostring(MUTE_SECONDS) .. "s", 3)
+          setNotice("СИРЕНА ОТКЛ. НА " .. tostring(MUTE_SECONDS) .. "с", 3)
         else
           muteUntil = 0
           muteSeverity = 0
-          setNotice("NO ACTIVE SIREN", 2)
+          setNotice("СИРЕНА НЕ АКТИВНА", 2)
         end
       elseif id == "sim_stop" then
         simScenario = nil
         muteUntil, muteSeverity = 0, 0
         page = "main"
         selectedKind, selectedKey = nil, nil
-        setNotice("SIMULATION STOPPED", 2)
+        setNotice("СИМУЛЯЦИЯ ОСТАНОВЛЕНА", 2)
       elseif id == "sim_clear" then
         simScenario = "NONE"
         simStart = now
-        setNotice("SIM: CLEAR", 2)
+        setNotice("СИМ: ЧИСТО", 2)
       elseif id == "sim_player" then
         simScenario, simStart = "PLAYER", now
       elseif id == "sim_fast" then
