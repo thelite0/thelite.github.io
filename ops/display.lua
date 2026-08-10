@@ -1,334 +1,352 @@
 local argv = {...}
 local unpackArgs = table.unpack or unpack
 
--- Interactive Russian UI shim + persistent player archive.
--- The main application stays pinned; this file adds Cyrillic rendering and
--- archives every player returned by the personnel sensor.
-local CORE_URL = "https://raw.githubusercontent.com/thelite0/thelite.github.io/ace5f5125d975b4c0c4229c059ac32266b20c7c8/ops/display.lua"
-local CORE_CACHE = ".display_core_ace5.lua"
-local RECORD_FILE = ".ops_player_records.json"
-local RECORD_SAVE_INTERVAL = 5
-local PERSON_RANGE = 1024
-local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442
+-- Proximity access-control layer. The previous display stays pinned underneath.
+local BASE_URL = "https://raw.githubusercontent.com/thelite0/thelite.github.io/b7654827709b49d5867b65cc2a3b52720f2853b9/ops/display.lua"
+local BASE_CACHE = ".display_base_b765.lua"
+local ACCESS_FILE = ".ops_access.json"
+local SIREN_SIDE = "back"
+
+local DEFAULT_ALLOW = {
+  "raz3ware",
+  "fant_om22",
+  "Nanapos",
+  "QXm",
+  "Skevor",
+  "Xero",
+}
 
 local nativeWrap = peripheral.wrap
 local nativePullEvent = os.pullEvent
+local nativeSetOutput = redstone.setOutput
 
-local gpuName, rawGpu
+local function lower(s) return string.lower(tostring(s or "")) end
+local function now() return os.epoch("utc") / 1000 end
+
+-- Persistent allowlist -------------------------------------------------------
+local allowed = {}
+local function resetAllow()
+  allowed = {}
+  for _, name in ipairs(DEFAULT_ALLOW) do allowed[lower(name)] = name end
+end
+resetAllow()
+
+local function saveAllow()
+  local names = {}
+  for _, display in pairs(allowed) do names[#names+1] = display end
+  table.sort(names, function(a,b) return lower(a) < lower(b) end)
+  local data = { version=1, names=names }
+  local body = textutils.serializeJSON and textutils.serializeJSON(data) or textutils.serialize(data)
+  local tmp = ACCESS_FILE .. ".tmp"
+  local f = assert(fs.open(tmp, "w")); f.write(body); f.close()
+  if fs.exists(ACCESS_FILE) then fs.delete(ACCESS_FILE) end
+  fs.move(tmp, ACCESS_FILE)
+end
+
+local function loadAllow()
+  if not fs.exists(ACCESS_FILE) then saveAllow(); return end
+  local ok, data = pcall(function()
+    local f = fs.open(ACCESS_FILE, "r"); if not f then return nil end
+    local body = f.readAll(); f.close()
+    return textutils.unserializeJSON and textutils.unserializeJSON(body) or textutils.unserialize(body)
+  end)
+  if not ok or type(data) ~= "table" or type(data.names) ~= "table" then return end
+  allowed = {}
+  for _, name in ipairs(data.names) do
+    if type(name) == "string" and name ~= "" then allowed[lower(name)] = name end
+  end
+end
+loadAllow()
+
+local function isAllowed(name)
+  return allowed[lower(name)] ~= nil
+end
+
+-- Locate the bitmap controller before installing wrappers. ------------------
+local gpuName, actualGpu
 for _, name in ipairs(peripheral.getNames()) do
   local p = nativeWrap(name)
   if p and type(p.refreshSize) == "function" and type(p.sync) == "function" and type(p.getSize) == "function" then
-    gpuName, rawGpu = name, p
+    gpuName, actualGpu = name, p
     break
   end
 end
-assert(rawGpu, "display controller not found")
+assert(actualGpu, "display controller not found")
 
-local C = {
-  panel=0xFF0B1216, panel2=0xFF101B20, border=0xFF31515A, text=0xFFE7F0F2,
-  dim=0xFF758990, cyan=0xFF49D9F2, blue=0xFF6AA6FF, green=0xFF4FE39B,
-  yellow=0xFFF0D15A, red=0xFFFF5C68, button=0xFF16242A, buttonOn=0xFF234552,
+local COL = {
+  panel=0xFF0B1216, panel2=0xFF101B20, border=0xFF31515A,
+  text=0xFFE7F0F2, dim=0xFF758990, green=0xFF4FE39B,
+  red=0xFFFF5C68, button=0xFF16242A, buttonOn=0xFF234552,
+  white=0xFFFFFFFF,
 }
 
-local FONT = {
-  ["А"]={"01110","10001","10001","11111","10001","10001","10001"},
-  ["Б"]={"11111","10000","10000","11110","10001","10001","11110"},
-  ["В"]={"11110","10001","10001","11110","10001","10001","11110"},
-  ["Г"]={"11111","10000","10000","10000","10000","10000","10000"},
-  ["Д"]={"00110","01010","01010","01010","01010","11111","10001"},
-  ["Е"]={"11111","10000","10000","11110","10000","10000","11111"},
-  ["Ё"]={"01010","11111","10000","11110","10000","10000","11111"},
-  ["Ж"]={"10101","10101","01110","00100","01110","10101","10101"},
-  ["З"]={"11110","00001","00001","01110","00001","00001","11110"},
-  ["И"]={"10001","10011","10101","10101","11001","10001","10001"},
-  ["Й"]={"01010","00100","10001","10011","10101","11001","10001"},
-  ["К"]={"10001","10010","10100","11000","10100","10010","10001"},
-  ["Л"]={"00111","01001","01001","01001","01001","10001","10001"},
-  ["М"]={"10001","11011","10101","10101","10001","10001","10001"},
-  ["Н"]={"10001","10001","10001","11111","10001","10001","10001"},
-  ["О"]={"01110","10001","10001","10001","10001","10001","01110"},
-  ["П"]={"11111","10001","10001","10001","10001","10001","10001"},
-  ["Р"]={"11110","10001","10001","11110","10000","10000","10000"},
-  ["С"]={"01111","10000","10000","10000","10000","10000","01111"},
-  ["Т"]={"11111","00100","00100","00100","00100","00100","00100"},
-  ["У"]={"10001","10001","10001","01111","00001","00001","11110"},
-  ["Ф"]={"00100","11111","10101","10101","11111","00100","00100"},
-  ["Х"]={"10001","10001","01010","00100","01010","10001","10001"},
-  ["Ц"]={"10010","10010","10010","10010","10010","11111","00001"},
-  ["Ч"]={"10001","10001","10001","01111","00001","00001","00001"},
-  ["Ш"]={"10101","10101","10101","10101","10101","10101","11111"},
-  ["Щ"]={"10101","10101","10101","10101","10101","11111","00001"},
-  ["Ъ"]={"11000","01000","01000","01110","01001","01001","01110"},
-  ["Ы"]={"10001","10001","10001","11101","10101","10101","11101"},
-  ["Ь"]={"10000","10000","10000","11110","10001","10001","11110"},
-  ["Э"]={"11110","00001","00001","01111","00001","00001","11110"},
-  ["Ю"]={"10110","11001","11001","11101","11001","11001","10110"},
-  ["Я"]={"01111","10001","10001","01111","00101","01001","10001"},
-}
-local LOWER = {
-  ["а"]="А",["б"]="Б",["в"]="В",["г"]="Г",["д"]="Д",["е"]="Е",["ё"]="Ё",["ж"]="Ж",
-  ["з"]="З",["и"]="И",["й"]="Й",["к"]="К",["л"]="Л",["м"]="М",["н"]="Н",["о"]="О",
-  ["п"]="П",["р"]="Р",["с"]="С",["т"]="Т",["у"]="У",["ф"]="Ф",["х"]="Х",["ц"]="Ц",
-  ["ч"]="Ч",["ш"]="Ш",["щ"]="Щ",["ъ"]="Ъ",["ы"]="Ы",["ь"]="Ь",["э"]="Э",["ю"]="Ю",["я"]="Я",
-}
+local function rect(x,y,w,h,c) actualGpu.filledRectangle(math.floor(x),math.floor(y),math.floor(w),math.floor(h),c) end
+local function outline(x,y,w,h,c) actualGpu.rectangle(math.floor(x),math.floor(y),math.floor(w),math.floor(h),c) end
+local function text(x,y,s,c,size)
+  pcall(actualGpu.drawText, math.floor(x), math.floor(y), tostring(s or ""), c or COL.text, 0x00000000, size or 1)
+end
+local function center(x,y,w,s,c,size)
+  size=size or 1
+  local width=#tostring(s or "") * 6 * size
+  text(x + math.floor((w-width)/2), y, s, c, size)
+end
 
-local function chars(s)
-  s=tostring(s or "")
-  local out,i={},1
-  while i<=#s do
-    local b=s:byte(i); local n=1
-    if b>=0xF0 then n=4 elseif b>=0xE0 then n=3 elseif b>=0xC0 then n=2 end
-    out[#out+1]=s:sub(i,i+n-1); i=i+n
-  end
-  return out
+-- Intruder state -------------------------------------------------------------
+local lastPlayers = {}
+local intruders = {}
+local intruderWanted = false
+local coreWanted = false
+
+local function playerName(v, i)
+  local n = v and v.username
+  if type(n) == "string" and n ~= "" then return n end
+  return "UNKNOWN-" .. tostring(i)
 end
-local function ulen(s) return #chars(s) end
-local function usub(s,a,b)
-  local c=chars(s); a=math.max(1,a or 1); b=math.min(#c,b or #c); local out={}
-  for i=a,b do out[#out+1]=c[i] end
-  return table.concat(out)
+
+local function playerDistance(v)
+  local x,y,z = tonumber(v and v.x), tonumber(v and v.y), tonumber(v and v.z)
+  if not x or not y or not z then return nil end
+  local dx,dy,dz = 1903-x,97-y,2442-z
+  return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
-local function short(s,n)
-  s=tostring(s or "НЕИЗВ.")
-  if ulen(s)<=n then return s end
-  return usub(s,1,math.max(1,n-3)).."..."
+
+local function applySiren()
+  nativeSetOutput(SIREN_SIDE, coreWanted or intruderWanted)
 end
-local function rrect(x,y,w,h,color) rawGpu.filledRectangle(math.floor(x),math.floor(y),math.floor(w),math.floor(h),color) end
-local function routline(x,y,w,h,color) rawGpu.rectangle(math.floor(x),math.floor(y),math.floor(w),math.floor(h),color) end
-local function drawGlyph(x,y,ch,color,scale)
-  local g=FONT[LOWER[ch] or ch]; if not g then return false end
-  scale=scale or 1
-  for ry,row in ipairs(g) do
-    for rx=1,5 do
-      if row:sub(rx,rx)=="1" then rrect(x+(rx-1)*scale,y+(ry-1)*scale,scale,scale,color) end
+
+local function rebuildThreat(raw)
+  lastPlayers = type(raw)=="table" and raw or {}
+  local nextIntruders = {}
+  for i,v in ipairs(lastPlayers) do
+    local name = playerName(v,i)
+    if not isAllowed(name) then
+      nextIntruders[lower(name)] = {
+        name=name,
+        distance=playerDistance(v),
+        seenAt=now(),
+      }
     end
   end
-  return true
+  intruders = nextIntruders
+  intruderWanted = next(intruders) ~= nil
+  applySiren()
 end
-local function drawText(x,y,s,color,bg,size)
-  size=size or 1; color=color or C.text; local cx=math.floor(x)
-  for _,ch in ipairs(chars(tostring(s))) do
-    if FONT[ch] or LOWER[ch] then drawGlyph(cx,y,ch,color,size)
-    else pcall(rawGpu.drawText,cx,y,ch,color,bg or 0x00000000,size) end
-    cx=cx+6*size
+
+local function primaryIntruder()
+  local best, count = nil, 0
+  for _,v in pairs(intruders) do
+    count = count + 1
+    if not best or (v.distance or 1e30) < (best.distance or 1e30) then best = v end
   end
-end
-local function textWidth(s,size) return ulen(s)*6*(size or 1) end
-local function centered(y,s,color,size,x,w)
-  x=x or 0; w=w or select(1,rawGpu.getSize()); drawText(x+math.floor((w-textWidth(s,size))/2),y,s,color,0x00000000,size)
+  return best, count
 end
 
--- Persistent player records.
-local db={version=1,players={}}
-local dirty=false
-local lastSave=0
-local present={}
-local motion={}
-local function now() return os.epoch("utc")/1000 end
-local function loadDb()
-  if not fs.exists(RECORD_FILE) then return end
-  local ok,data=pcall(function()
-    local f=fs.open(RECORD_FILE,"r"); if not f then return nil end
-    local s=f.readAll(); f.close()
-    return textutils.unserializeJSON and textutils.unserializeJSON(s) or textutils.unserialize(s)
-  end)
-  if ok and type(data)=="table" and type(data.players)=="table" then db=data end
-end
-local function saveDb(force)
-  local t=now(); if not dirty then return end
-  if not force and t-lastSave<RECORD_SAVE_INTERVAL then return end
-  local ok=pcall(function()
-    local s=textutils.serializeJSON and textutils.serializeJSON(db) or textutils.serialize(db)
-    local tmp=RECORD_FILE..".tmp"; local f=assert(fs.open(tmp,"w")); f.write(s); f.close()
-    if fs.exists(RECORD_FILE) then fs.delete(RECORD_FILE) end; fs.move(tmp,RECORD_FILE)
-  end)
-  if ok then dirty=false; lastSave=t end
-end
-loadDb()
-
-local function distance(wx,wy,wz)
-  local x,y,z=ORIGIN_X-wx,ORIGIN_Y-wy,ORIGIN_Z-wz
-  return math.sqrt(x*x+y*y+z*z)
-end
-local function recordPlayers(raw)
-  local t=now(); local current={}
-  for i,v in ipairs(raw or {}) do
-    local name=tostring(v.username or ("UNKNOWN-"..i)); current[name]=true
-    local wx,wy,wz=v.x or ORIGIN_X,v.y or ORIGIN_Y,v.z or ORIGIN_Z; local d=distance(wx,wy,wz)
-    local r=db.players[name]; local fresh=false
-    if not r then r={name=name,firstSeen=t,lastSeen=t,sessions=1,samples=0,observed=0,closest=d,maxSpeed=0,maxClosing=0}; db.players[name]=r; fresh=true end
-    local m=motion[name]; local speed,closing=0,0
-    if m then local dt=t-m.t; if dt>0 and dt<4 then local dx,dy,dz=wx-m.x,wy-m.y,wz-m.z; speed=math.sqrt(dx*dx+dy*dy+dz*dz)/dt; closing=(m.d-d)/dt; r.observed=(r.observed or 0)+dt end end
-    if not fresh and not present[name] and (not r.lastSeen or t-r.lastSeen>3) then r.sessions=(r.sessions or 0)+1 end
-    r.samples=(r.samples or 0)+1; r.lastSeen=t; r.lastX,r.lastY,r.lastZ=wx,wy,wz; r.lastDistance=d
-    r.closest=math.min(r.closest or d,d); r.maxSpeed=math.max(r.maxSpeed or 0,speed); r.maxClosing=math.max(r.maxClosing or 0,closing)
-    r.lastHealth=v.health; r.maxHealth=v.maxHealth; motion[name]={x=wx,y=wy,z=wz,d=d,t=t}; dirty=true
+-- Siren OR gate: core alerts still work, but a non-allowed person cannot be
+-- silenced by the core's normal mute/ack logic.
+local function guardedSetOutput(side, value)
+  if side == SIREN_SIDE then
+    coreWanted = value and true or false
+    return nativeSetOutput(side, coreWanted or intruderWanted)
   end
-  present=current; saveDb(false)
+  return nativeSetOutput(side, value)
+end
+redstone.setOutput = guardedSetOutput
+if type(rs) == "table" then rs.setOutput = guardedSetOutput end
+
+-- Touchscreen allowlist UI ---------------------------------------------------
+local wlOpen = false
+local wlOffset = 1
+local wlHits = {}
+local currentNames = {}
+
+local function readArchiveNames(out)
+  if not fs.exists(".ops_player_records.json") then return end
+  pcall(function()
+    local f=fs.open(".ops_player_records.json","r"); if not f then return end
+    local body=f.readAll(); f.close()
+    local data=textutils.unserializeJSON and textutils.unserializeJSON(body) or textutils.unserialize(body)
+    if type(data)=="table" and type(data.players)=="table" then
+      for key,r in pairs(data.players) do
+        local name=(type(r)=="table" and r.name) or key
+        if type(name)=="string" and name~="" then out[lower(name)]=name end
+      end
+    end
+  end)
 end
 
--- Kyiv time (EET/EEST, EU-style last-Sunday DST rule).
-local function weekday(y,m,d)
-  local a={0,3,2,5,0,3,5,1,4,6,2,4}; if m<3 then y=y-1 end
-  return (y+math.floor(y/4)-math.floor(y/100)+math.floor(y/400)+a[m]+d)%7
-end
-local function lastSunday(y,m)
-  local days=({31,28,31,30,31,30,31,31,30,31,30,31})[m]
-  if m==2 and ((y%4==0 and y%100~=0) or y%400==0) then days=29 end
-  return days-weekday(y,m,days)
-end
-local function kyivOffset(epoch)
-  local u=os.date("!*t",epoch)
-  if u.month>3 and u.month<10 then return 3 end
-  if u.month<3 or u.month>10 then return 2 end
-  if u.month==3 then local d=lastSunday(u.year,3); return (u.day>d or (u.day==d and u.hour>=1)) and 3 or 2 end
-  local d=lastSunday(u.year,10); return (u.day<d or (u.day==d and u.hour<1)) and 3 or 2
-end
-local function fmtTime(epoch,full)
-  if not epoch then return "--" end
-  local t=os.date("!*t",epoch+kyivOffset(epoch)*3600)
-  if full then return string.format("%02d.%02d.%02d %02d:%02d",t.day,t.month,t.year%100,t.hour,t.min) end
-  return string.format("%02d.%02d %02d:%02d",t.day,t.month,t.hour,t.min)
-end
-local function fmtDuration(sec)
-  sec=math.max(0,math.floor(sec or 0)); local h=math.floor(sec/3600); local m=math.floor((sec%3600)/60); local s=sec%60
-  return h>0 and string.format("%d:%02d:%02d",h,m,s) or string.format("%02d:%02d",m,s)
-end
-
--- Archive overlay. It replaces only the body, so the live alert header and
--- footer from the core remain visible and operational.
-local historyMode=false
-local historySort="last"
-local historyOffset=1
-local historySelected=nil
-local historyHits={}
-local function addHit(id,x,y,w,h,data) historyHits[#historyHits+1]={id=id,x=x,y=y,w=w,h=h,data=data} end
-local function button(id,x,y,w,h,label,active)
-  rrect(x,y,w,h,active and C.buttonOn or C.button); routline(x,y,w,h,active and C.cyan or C.border); centered(y+3,label,active and C.cyan or C.text,1,x,w); addHit(id,x,y,w,h)
-end
-local function archiveRows()
-  local rows={}; for _,r in pairs(db.players) do rows[#rows+1]=r end
+local function whitelistRows()
+  local map = {}
+  for k,v in pairs(allowed) do map[k]=v end
+  for k,v in pairs(currentNames) do map[k]=v end
+  readArchiveNames(map)
+  local rows = {}
+  for _,name in pairs(map) do rows[#rows+1]=name end
   table.sort(rows,function(a,b)
-    if historySort=="name" then return tostring(a.name):lower()<tostring(b.name):lower() end
-    if historySort=="closest" then local x,y=a.closest or 1e9,b.closest or 1e9; if x~=y then return x<y end end
-    if historySort=="sessions" then local x,y=a.sessions or 0,b.sessions or 0; if x~=y then return x>y end end
-    return (a.lastSeen or 0)>(b.lastSeen or 0)
+    local aa,bb=isAllowed(a),isAllowed(b)
+    if aa~=bb then return aa end
+    return lower(a)<lower(b)
   end)
   return rows
 end
-local function archiveButton(active)
-  local w=select(1,rawGpu.getSize()); if not w or w<=0 then return end
-  local x=w-34; local y=8
-  rrect(x,y,28,12,active and C.buttonOn or C.button); routline(x,y,28,12,active and C.cyan or C.border); centered(y+3,"АРХ",active and C.cyan or C.text,1,x,28)
+
+local function addHit(id,x,y,w,h,data)
+  wlHits[#wlHits+1]={id=id,x=x,y=y,w=w,h=h,data=data}
 end
-local function renderArchive()
-  local W,H=rawGpu.getSize(); if not W or W<=0 then return end
-  historyHits={}; local x,y,w,h=6,46,W-12,H-82
-  rrect(x,y,w,h,C.panel); routline(x,y,w,h,C.border)
-  local rows=archiveRows(); drawText(x+6,y+5,"АРХИВ ИГРОКОВ: "..#rows,C.text,0x00000000,1)
-  if historySelected then
-    local r=db.players[historySelected]
-    if not r then historySelected=nil else
-      button("back",x+w-31,y+3,26,12,"НАЗ",false)
-      local active=present[r.name] and true or false
-      drawText(x+6,y+20,short(r.name,18),active and C.green or C.blue,0x00000000,1)
-      drawText(x+6,y+32,active and "СЕЙЧАС: В РАДИУСЕ" or "СЕЙЧАС: НЕ ВИДЕН",active and C.green or C.dim,0x00000000,1)
-      drawText(x+6,y+44,"ПЕРВЫЙ: "..fmtTime(r.firstSeen,true),C.text,0x00000000,1)
-      drawText(x+6,y+56,"ПОСЛЕД.: "..fmtTime(r.lastSeen,true),C.text,0x00000000,1)
-      drawText(x+6,y+68,string.format("СЕАНСЫ: %d  ВРЕМЯ: %s",r.sessions or 0,fmtDuration(r.observed or 0)),C.dim,0x00000000,1)
-      drawText(x+6,y+80,string.format("МИН.ДИСТ: %.0f  МАКС.V: %.1f",r.closest or 0,r.maxSpeed or 0),C.text,0x00000000,1)
-      drawText(x+6,y+92,string.format("МАКС.СБЛ: %.1f  HP: %.0f/%.0f",r.maxClosing or 0,r.lastHealth or 0,r.maxHealth or 0),C.text,0x00000000,1)
-      drawText(x+6,y+104,string.format("КООРД: %.0f %.0f %.0f",r.lastX or 0,r.lastY or 0,r.lastZ or 0),C.dim,0x00000000,1)
-      archiveButton(true); return
-    end
+local function hit(h,x,y)
+  return x>=h.x and x<h.x+h.w and y>=h.y and y<h.y+h.h
+end
+local function smallButton(id,x,y,w,h,label,active,data)
+  rect(x,y,w,h,active and COL.buttonOn or COL.button)
+  outline(x,y,w,h,active and COL.green or COL.border)
+  center(x,y+3,w,label,active and COL.green or COL.text,1)
+  addHit(id,x,y,w,h,data)
+end
+
+local function drawTopButton()
+  local W=select(1,actualGpu.getSize()); if not W or W<=0 then return end
+  local x=W-68
+  rect(x,8,28,12,wlOpen and COL.buttonOn or COL.button)
+  outline(x,8,28,12,wlOpen and COL.green or COL.border)
+  center(x,11,28,"WL",wlOpen and COL.green or COL.text,1)
+end
+
+local function drawDanger()
+  if not intruderWanted then return end
+  local W=select(1,actualGpu.getSize()); if not W or W<=0 then return end
+  local p,count=primaryIntruder(); if not p then return end
+  rect(4,23,W-8,17,0xFF681B23)
+  outline(4,23,W-8,17,COL.red)
+  local suffix = count>1 and (" +"..tostring(count-1)) or ""
+  local d = p.distance and string.format(" %.0fm",p.distance) or ""
+  local msg = "DANGER " .. tostring(p.name) .. d .. suffix
+  if #msg>28 then msg=msg:sub(1,28) end
+  center(4,28,W-8,msg,COL.white,1)
+end
+
+local function renderWhitelist()
+  local W,H=actualGpu.getSize(); if not W or W<=0 then return end
+  wlHits={}
+  local x,y,w,h=6,46,W-12,H-82
+  rect(x,y,w,h,COL.panel); outline(x,y,w,h,COL.border)
+  text(x+6,y+5,"WHITELIST",COL.text,1)
+  smallButton("close",x+w-36,y+3,31,12,"BACK",false)
+  smallButton("reset",x+w-76,y+3,36,12,"RESET",false)
+
+  local rows=whitelistRows()
+  local rowCount=7
+  local maxOffset=math.max(1,#rows-rowCount+1)
+  wlOffset=math.max(1,math.min(wlOffset,maxOffset))
+  local yy=y+23
+  for i=wlOffset,math.min(#rows,wlOffset+rowCount-1) do
+    local name=rows[i]
+    local ok=isAllowed(name)
+    local c=ok and COL.green or COL.red
+    text(x+6,yy,name,c,1)
+    text(x+w-45,yy,ok and "ALLOW" or "ALARM",c,1)
+    addHit("toggle",x+4,yy-2,w-8,10,name)
+    yy=yy+11
   end
-  button("sort_last",x+6,y+16,34,12,"ПОСЛ",historySort=="last")
-  button("sort_name",x+43,y+16,34,12,"ИМЯ",historySort=="name")
-  button("sort_close",x+80,y+16,34,12,"БЛИЗ",historySort=="closest")
-  button("sort_sessions",x+117,y+16,34,12,"СЕАН",historySort=="sessions")
-  local rowCount=7; local maxOffset=math.max(1,#rows-rowCount+1); historyOffset=math.max(1,math.min(historyOffset,maxOffset)); local yy=y+34
-  for i=historyOffset,math.min(#rows,historyOffset+rowCount-1) do
-    local r=rows[i]; local active=present[r.name] and true or false
-    drawText(x+6,yy,active and "*" or "-",active and C.green or C.dim,0x00000000,1)
-    drawText(x+16,yy,short(r.name,10),active and C.green or C.blue,0x00000000,1)
-    drawText(x+82,yy,fmtTime(r.lastSeen,false),C.text,0x00000000,1)
-    drawText(x+156,yy,r.lastDistance and string.format("%.0f",r.lastDistance) or "--",C.dim,0x00000000,1)
-    addHit("row",x+4,yy-2,w-8,10,r.name); yy=yy+10
-  end
-  if #rows==0 then centered(y+58,"АРХИВ ПОКА ПУСТ",C.dim,1,x,w) end
-  button("prev",x+6,y+h-15,34,11,"ПРЕД",false); button("next",x+43,y+h-15,34,11,"СЛЕД",false)
-  drawText(x+84,y+h-12,"КИЕВСКОЕ ВРЕМЯ",C.dim,0x00000000,1); archiveButton(true)
+  if #rows==0 then text(x+6,y+35,"NO RECORDS",COL.dim,1) end
+  smallButton("prev",x+6,y+h-15,34,11,"PREV",false)
+  smallButton("next",x+43,y+h-15,34,11,"NEXT",false)
+  text(x+84,y+h-12,tostring(#rows).." KNOWN",COL.dim,1)
+  drawTopButton()
+  drawDanger()
 end
-local function archiveButtonHit(x,y)
-  local W=select(1,rawGpu.getSize()); return x>=W-34 and x<W-6 and y>=8 and y<20
+
+local function topButtonHit(x,y)
+  local W=select(1,actualGpu.getSize())
+  return x>=W-68 and x<W-40 and y>=8 and y<20
 end
-local function handleArchiveClick(x,y)
-  for i=#historyHits,1,-1 do
-    local h=historyHits[i]
-    if x>=h.x and x<h.x+h.w and y>=h.y and y<h.y+h.h then
-      if h.id=="row" then historySelected=h.data
-      elseif h.id=="back" then historySelected=nil
-      elseif h.id=="sort_last" then historySort="last"; historyOffset=1
-      elseif h.id=="sort_name" then historySort="name"; historyOffset=1
-      elseif h.id=="sort_close" then historySort="closest"; historyOffset=1
-      elseif h.id=="sort_sessions" then historySort="sessions"; historyOffset=1
-      elseif h.id=="prev" then historyOffset=math.max(1,historyOffset-7)
-      elseif h.id=="next" then historyOffset=historyOffset+7 end
-      renderArchive(); rawGpu.sync(); return true
+
+local function reevaluate()
+  rebuildThreat(lastPlayers)
+end
+
+local function handleWhitelistTouch(x,y)
+  for i=#wlHits,1,-1 do
+    local h=wlHits[i]
+    if hit(h,x,y) then
+      if h.id=="close" then
+        wlOpen=false
+      elseif h.id=="reset" then
+        resetAllow(); saveAllow(); reevaluate(); wlOffset=1
+      elseif h.id=="toggle" then
+        local key=lower(h.data)
+        if allowed[key] then allowed[key]=nil else allowed[key]=h.data end
+        saveAllow(); reevaluate()
+      elseif h.id=="prev" then
+        wlOffset=math.max(1,wlOffset-7)
+      elseif h.id=="next" then
+        wlOffset=wlOffset+7
+      end
+      return true
     end
   end
   return false
 end
 
--- GPU proxy: preserve all methods, replace text renderer, and draw archive overlay.
-local gpuProxy={}
-setmetatable(gpuProxy,{__index=function(_,k)
-  local v=rawGpu[k]
+-- GPU proxy sits underneath the existing UI. Its sync runs last, so emergency
+-- status and the allowlist panel remain visible even while the core redraws.
+local guardGpu={}
+setmetatable(guardGpu,{__index=function(_,k)
+  local v=actualGpu[k]
   if type(v)=="function" then return function(...) return v(...) end end
   return v
 end})
-gpuProxy.drawText=function(x,y,s,color,bg,size) return drawText(x,y,s,color,bg,size) end
-gpuProxy.sync=function(...)
-  if historyMode then renderArchive() else archiveButton(false) end
-  return rawGpu.sync(...)
+guardGpu.sync=function(...)
+  drawTopButton()
+  drawDanger()
+  if wlOpen then renderWhitelist() end
+  return actualGpu.sync(...)
 end
 
-local proxyCache={}
+local peripheralCache={}
 peripheral.wrap=function(name)
-  if name==gpuName then return gpuProxy end
-  if proxyCache[name] then return proxyCache[name] end
+  if name==gpuName then return guardGpu end
+  if peripheralCache[name] then return peripheralCache[name] end
   local raw=nativeWrap(name); if not raw then return nil end
   if type(raw.scanForPlayers)=="function" then
     local p={}
-    setmetatable(p,{__index=function(_,k) local v=raw[k]; if type(v)=="function" then return function(...) return v(...) end end; return v end})
+    setmetatable(p,{__index=function(_,k)
+      local v=raw[k]
+      if type(v)=="function" then return function(...) return v(...) end end
+      return v
+    end})
     p.scanForPlayers=function(radius)
       local result=raw.scanForPlayers(radius)
-      if type(result)=="table" then recordPlayers(result) else present={} end
+      currentNames={}
+      if type(result)=="table" then
+        for i,v in ipairs(result) do
+          local n=playerName(v,i); currentNames[lower(n)]=n
+        end
+        rebuildThreat(result)
+      else
+        rebuildThreat({})
+      end
       return result
     end
-    proxyCache[name]=p; return p
+    peripheralCache[name]=p
+    return p
   end
   return raw
 end
 
--- Consume archive clicks while leaving the core's timers/scanning alive.
+-- This becomes the previous layer's native event source. WL touches are
+-- consumed here; timers and all other events continue to the main display.
 os.pullEvent=function(filter)
   while true do
     local ev={nativePullEvent(filter)}
     if ev[1]=="tm_monitor_touch" then
       local x,y=ev[3],ev[4]
-      if archiveButtonHit(x,y) then
-        historyMode=not historyMode; historySelected=nil
-        if historyMode then renderArchive() else archiveButton(false) end
-        rawGpu.sync()
-      elseif historyMode then
-        local _,H=rawGpu.getSize()
-        if y<46 or y>=H-30 then
-          historyMode=false
-          return unpackArgs(ev)
-        else
-          handleArchiveClick(x,y)
-        end
+      if topButtonHit(x,y) then
+        wlOpen=not wlOpen; wlOffset=1
+        if wlOpen then renderWhitelist() else drawTopButton() end
+        actualGpu.sync()
+      elseif wlOpen then
+        handleWhitelistTouch(x,y)
+        if wlOpen then renderWhitelist() end
+        actualGpu.sync()
       else
         return unpackArgs(ev)
       end
@@ -338,17 +356,20 @@ os.pullEvent=function(filter)
   end
 end
 
-local function ensureCore()
-  if fs.exists(CORE_CACHE) then return end
+local function ensureBase()
+  if fs.exists(BASE_CACHE) then return end
   assert(http and http.get,"HTTP API unavailable")
-  local r=assert(http.get(CORE_URL),"failed to download display core")
-  local body=r.readAll(); r.close(); local f=assert(fs.open(CORE_CACHE,"w")); f.write(body); f.close()
+  local r=assert(http.get(BASE_URL),"failed to download display base")
+  local body=r.readAll(); r.close()
+  local f=assert(fs.open(BASE_CACHE,"w")); f.write(body); f.close()
 end
 
-ensureCore()
-local core,err=loadfile(CORE_CACHE)
-if not core then error(err,0) end
-local ok,res=pcall(core,unpackArgs(argv))
-saveDb(true)
+ensureBase()
+local base,err=loadfile(BASE_CACHE)
+if not base then error(err,0) end
+local ok,res=pcall(base,unpackArgs(argv))
+-- Do not leave a stale emergency output if the program exits normally.
+intruderWanted=false
+applySiren()
 if not ok then error(res,0) end
 return res
