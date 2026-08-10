@@ -1,8 +1,8 @@
 local argv = {...}
 local unpackArgs = table.unpack or unpack
 
--- Relocation shim. Keeps the previous display/access-control stack pinned,
--- but rewrites its local origin constants before it is loaded.
+-- Relocation + noise-hardening shim. Keeps the previous display/access-control
+-- stack pinned, but rewrites local origin constants and hardens motion tracking.
 local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1833, 89, 2458
 
 -- Preserve the same monitored world direction as before.
@@ -93,10 +93,74 @@ ensurePatched(BASE_URL, BASE_CACHE, {
   {"local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442", newOrigin},
 })
 
--- Main tracker: player local coordinates + monitored direction.
+-- NeoPeripheral survival radar intentionally adds error proportional to range:
+-- err = distance / pi^3. Raw regression over that jitter can make a stationary
+-- contact look like it is closing. Keep a longer window and accept closing
+-- speed only when its regression slope is statistically well above the known
+-- sensor noise floor.
+local filterAnchor = "local function totalSpeed(h)"
+local filterCode = [[
+local RADAR_NOISE_FRACTION = 1 / (math.pi * math.pi * math.pi)
+local SUB_NOISE_MIN_SAMPLES = 8
+local SUB_NOISE_MIN_WINDOW = 4.5
+local SUB_NOISE_MIN_Z = 4.5
+
+local function filteredSubClosing(h)
+  local n = #h
+  if n < SUB_NOISE_MIN_SAMPLES then return 0 end
+
+  local window = h[n].t - h[1].t
+  if window < SUB_NOISE_MIN_WINDOW then return 0 end
+
+  local raw = closingRate(h)
+  if raw <= 0 then return 0 end
+
+  local t0 = h[1].t
+  local st, stt, sd = 0, 0, 0
+  for _, p in ipairs(h) do
+    local t = p.t - t0
+    st = st + t
+    stt = stt + t * t
+    sd = sd + math.abs(p.d or 0)
+  end
+
+  local sxx = stt - (st * st) / n
+  if sxx <= 0.0001 then return 0 end
+
+  local meanD = sd / n
+  -- One radar distance sample has uniform error in +/- distance/pi^3.
+  -- sigma for uniform(-a,a) is a/sqrt(3).
+  local sigma = math.max(1, meanD * RADAR_NOISE_FRACTION / math.sqrt(3))
+  local slopeSigma = sigma / math.sqrt(sxx)
+  if slopeSigma <= 0 then return 0 end
+
+  local z = raw / slopeSigma
+  if z < SUB_NOISE_MIN_Z then return 0 end
+
+  return raw
+end
+
+local function totalSpeed(h)]]
+
+local oldSubClosing = [[local tr = ensureTrack(subTracks, key)
+    addSample(tr, sample, now)
+    local closing = closingRate(tr.history)
+    local row = {]]
+
+local newSubClosing = [[local tr = ensureTrack(subTracks, key)
+    addSample(tr, sample, now)
+    local closing = filteredSubClosing(tr.history)
+    local row = {]]
+
+-- Main tracker: player local coordinates + monitored direction + robust
+-- contraption closing detection.
 ensurePatched(CORE_URL, CORE_CACHE, {
   {"local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442", newOrigin},
   {"local SECTOR_X, SECTOR_Z = 1881, 1632", newSector},
+  {"local HISTORY = 10", "local HISTORY = 16"},
+  {"local SUB_MIN_SAMPLES = 4", "local SUB_MIN_SAMPLES = 8"},
+  {filterAnchor, filterCode},
+  {oldSubClosing, newSubClosing},
 })
 
 local guard, err = loadfile(GUARD_CACHE)
