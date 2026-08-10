@@ -8,16 +8,10 @@ local SCAN_INTERVAL = 1.0
 local HISTORY = 8
 local TRACK_TTL = 12
 
--- Known monitored sector in NeoRadar local coordinates (radar - target).
 local SECTOR_X, SECTOR_Z = 1881, 1632
 local SECTOR_LEN = math.sqrt(SECTOR_X * SECTOR_X + SECTOR_Z * SECTOR_Z)
 local SECTOR_COS = 0.70
 
-local function nowSeconds()
-  return os.epoch("utc") / 1000
-end
-
--- Find Tom's GPU without depending on which side it is attached to.
 local gpu, gpuSide
 for _, name in ipairs(peripheral.getNames()) do
   local p = peripheral.wrap(name)
@@ -28,7 +22,6 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 assert(gpu, "compatible display controller not found")
 
--- Tom's refreshSize() is asynchronous. Wait for a real monitor size.
 local W, H = 0, 0
 for _ = 1, 30 do
   gpu.refreshSize()
@@ -42,7 +35,6 @@ gpu.setSize(64)
 sleep(0.1)
 W, H = gpu.getSize()
 
--- Find NeoRadar.
 local radar
 for _, name in ipairs(peripheral.getNames()) do
   local p = peripheral.wrap(name)
@@ -54,22 +46,34 @@ end
 if not TEST_MODE then assert(radar, "neo radar not found") end
 
 local C = {
-  bg      = 0xFF05090C,
-  panel   = 0xFF0A1217,
-  panel2  = 0xFF0D1A20,
-  grid    = 0xFF16323A,
-  border  = 0xFF2B5560,
-  text    = 0xFFE5F0F2,
-  dim     = 0xFF71858C,
-  cyan    = 0xFF49D9F2,
-  green   = 0xFF51E39B,
-  yellow  = 0xFFF2D35F,
-  orange  = 0xFFF39A4A,
-  red     = 0xFFFF5964,
-  darkred = 0xFF351218,
+  bg        = 0xFF070B0D,
+  panel     = 0xFF10161A,
+  panel2    = 0xFF131C21,
+  panel3    = 0xFF0B1115,
+  border    = 0xFF38505B,
+  grid      = 0xFF17313A,
+  stripeA   = 0xFF644F17,
+  stripeB   = 0xFF1A1710,
+  text      = 0xFFE5EEF2,
+  dim       = 0xFF7C8F97,
+  cyan      = 0xFF4BDCF6,
+  green     = 0xFF4FE39B,
+  yellow    = 0xFFF0D15A,
+  orange    = 0xFFFF9D3A,
+  red       = 0xFFFF5C68,
+  magenta   = 0xFFFF62D3,
+  darkGreen = 0xFF19392A,
+  darkRed   = 0xFF38191D,
 }
 
--- The GPU is strict about primitives touching the framebuffer edge.
+local LEVELS = {
+  TRACK   = {rank = 0, color = C.cyan},
+  WATCH   = {rank = 1, color = C.yellow},
+  INBOUND = {rank = 2, color = C.orange},
+  HIGH    = {rank = 3, color = C.red},
+  CRIT    = {rank = 4, color = C.magenta},
+}
+
 local MIN_X, MIN_Y = 2, 2
 local MAX_X, MAX_Y = math.max(2, W - 2), math.max(2, H - 2)
 
@@ -84,8 +88,10 @@ local function rect(x, y, w, h, c)
   if w < 1 or h < 1 then return end
   x = clamp(x, MIN_X, MAX_X)
   y = clamp(y, MIN_Y, MAX_Y)
-  w = math.min(w, MAX_X - x)
-  h = math.min(h, MAX_Y - y)
+  local maxW = MAX_X - x + 1
+  local maxH = MAX_Y - y + 1
+  w = math.min(w, maxW)
+  h = math.min(h, maxH)
   if w >= 1 and h >= 1 then gpu.filledRectangle(x, y, w, h, c) end
 end
 
@@ -93,8 +99,8 @@ local function outline(x, y, w, h, c)
   x, y, w, h = math.floor(x), math.floor(y), math.floor(w), math.floor(h)
   x = clamp(x, MIN_X, MAX_X)
   y = clamp(y, MIN_Y, MAX_Y)
-  w = math.min(w, MAX_X - x)
-  h = math.min(h, MAX_Y - y)
+  w = math.min(w, MAX_X - x + 1)
+  h = math.min(h, MAX_Y - y + 1)
   if w >= 2 and h >= 2 then gpu.rectangle(x, y, w, h, c) end
 end
 
@@ -108,252 +114,344 @@ end
 
 local function txt(x, y, s, c, size)
   x = clamp(math.floor(x), MIN_X, MAX_X - 2)
-  y = clamp(math.floor(y), MIN_Y, MAX_Y - 7)
-  pcall(gpu.drawText, x, y, tostring(s), c or C.text, 0x00000000, size or 1)
+  y = clamp(math.floor(y), MIN_Y, MAX_Y - 8)
+  local ok = pcall(gpu.drawText, x, y, tostring(s), c or C.text, 0x00000000, size or 1)
+  if not ok and (size or 1) ~= 1 then
+    pcall(gpu.drawText, x, y, tostring(s), c or C.text, 0x00000000, 1)
+  end
 end
 
-local function uuidKey(v)
-  local q = v.id or {}
-  return tostring(q[1]) .. ":" .. tostring(q[2]) .. ":" .. tostring(q[3]) .. ":" .. tostring(q[4])
+local function stripes(x, y, w, h)
+  rect(x, y, w, h, C.panel3)
+  for i = -h, w, 10 do
+    line(x + i, y + h - 1, x + i + h, y, C.stripeA)
+    line(x + i + 4, y + h - 1, x + i + h + 4, y, C.stripeB)
+  end
+  outline(x, y, w, h, C.border)
+end
+
+local function bar(x, y, w, h, frac, fill, bg)
+  rect(x, y, w, h, bg or C.panel3)
+  outline(x, y, w, h, C.border)
+  local fw = math.max(0, math.min(w - 2, math.floor((w - 2) * clamp(frac, 0, 1))))
+  if fw > 0 then rect(x + 1, y + 1, fw, h - 2, fill) end
+end
+
+local function shortLabel(s, n)
+  s = tostring(s or "UNKNOWN")
+  if #s <= n then return s end
+  return s:sub(1, math.max(1, n - 3)) .. "..."
+end
+
+local function keyOf(v)
+  if type(v.id) == "table" then
+    local out = {}
+    for _, k in ipairs(v.id) do out[#out + 1] = tostring(k) end
+    if #out > 0 then return table.concat(out, ":") end
+  elseif v.id ~= nil then
+    return tostring(v.id)
+  end
+  local name = v.name and tostring(v.name) or "CONTACT"
+  return name .. "@" .. math.floor(v.x or 0) .. ":" .. math.floor(v.z or 0)
 end
 
 local function inSector(x, z)
-  local hz = math.sqrt(x * x + z * z)
-  if hz <= 0 then return false end
-  return (x * SECTOR_X + z * SECTOR_Z) / (hz * SECTOR_LEN) > SECTOR_COS
-end
-
--- Linear regression of distance over time. Positive result means closing.
-local function closingRate(h)
-  if #h < 4 then return 0 end
-  local t0 = h[1].t
-  local n, st, sd, stt, std = #h, 0, 0, 0, 0
-  for _, p in ipairs(h) do
-    local t = p.t - t0
-    st = st + t
-    sd = sd + p.d
-    stt = stt + t * t
-    std = std + t * p.d
-  end
-  local den = n * stt - st * st
-  if math.abs(den) < 0.0001 then return 0 end
-  local slope = (n * std - st * sd) / den
-  return -slope
-end
-
-local function totalSpeed(h)
-  if #h < 2 then return 0 end
-  local a, b = h[1], h[#h]
-  local dt = b.t - a.t
-  if dt <= 0 then return 0 end
-  local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
-  return math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+  local h = math.sqrt(x * x + z * z)
+  if h < 1 then return false, 0 end
+  local dot = (x * SECTOR_X + z * SECTOR_Z) / (h * SECTOR_LEN)
+  return dot >= SECTOR_COS, dot
 end
 
 local tracks = {}
-local rows = {}
+local logs = {}
+local lastState = "BOOT"
+local lastSiren = false
+local lastCount = -1
 
-local function classify(row, samples)
-  local rank, label = 0, "TRACK"
-  if row.sector then rank, label = 1, "WATCH" end
+local function pushLog(msg)
+  table.insert(logs, 1, string.format("[%s] %s", textutils.formatTime(os.time(), true), msg))
+  while #logs > 4 do table.remove(logs) end
+end
+pushLog(TEST_MODE and "TEST MODE ACTIVE" or "DISPLAY ONLINE")
 
-  local threshold = row.d > 1500 and 12 or 6
-  local inbound = row.sector and samples >= 4 and row.closing > threshold
-  if inbound then
-    rank, label = 2, "INBOUND"
-    if row.d < 1200 or (row.eta and row.eta < 60) then rank, label = 3, "HIGH" end
-    if row.d < 500 or (row.eta and row.eta < 20) then rank, label = 4, "CRIT" end
+local function ensureTrack(k)
+  local t = tracks[k]
+  if not t then
+    t = {history = {}, name = k}
+    tracks[k] = t
   end
-
-  row.rank, row.label = rank, label
+  return t
 end
 
-local function scanReal(now)
-  local result = radar.scanForSubLevels(RANGE) or {}
-  local out = {}
+local function updateHistory(track, sample, now)
+  local h = track.history
+  h[#h + 1] = {t = now, d = sample.distance or 0, x = sample.x or 0, y = sample.y or 0, z = sample.z or 0}
+  while #h > HISTORY do table.remove(h, 1) end
+  track.lastSeen = now
+  track.name = sample.name or track.name
+end
 
-  for _, v in ipairs(result) do
-    local k = uuidKey(v)
-    local tr = tracks[k]
-    if not tr then
-      tr = {history = {}, firstSeen = now}
-      tracks[k] = tr
+local function metrics(track)
+  local h = track.history
+  local spd, closing = 0, 0
+  if #h >= 2 then
+    local a, b = h[1], h[#h]
+    local dt = b.t - a.t
+    if dt > 0 then
+      local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+      spd = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+      closing = (a.d - b.d) / dt
     end
-    tr.lastSeen = now
+  end
+  return spd, closing
+end
 
-    local h = tr.history
-    h[#h + 1] = {t = now, d = v.distance, x = v.x, y = v.y, z = v.z}
-    while #h > HISTORY do table.remove(h, 1) end
+local function classify(track, sample)
+  local d = sample.distance or 0
+  local speed, closing = metrics(track)
+  local sector, dot = inSector(sample.x or 0, sample.z or 0)
+  local eta = closing > 0.5 and d / closing or nil
 
-    local cl = closingRate(h)
-    local sp = totalSpeed(h)
-    local eta = cl > 1 and (v.distance / cl) or nil
+  local state = "TRACK"
+  local rank = 0
 
-    local row = {
-      key = k,
-      name = v.name or "UNKNOWN",
-      x = v.x,
-      y = v.y,
-      z = v.z,
-      d = v.distance,
-      closing = cl,
-      speed = sp,
-      eta = eta,
-      sector = inSector(v.x, v.z),
-      samples = #h,
-    }
-    classify(row, #h)
-    out[#out + 1] = row
+  if sector then
+    state, rank = "WATCH", 1
+    local inbound = closing > (d > 1500 and 10 or d > 900 and 6 or 3)
+    if inbound then
+      state, rank = "INBOUND", 2
+      if d < 1200 or (eta and eta < 70) then state, rank = "HIGH", 3 end
+      if d < 550 or (eta and eta < 25) then state, rank = "CRIT", 4 end
+    end
   end
 
-  for k, tr in pairs(tracks) do
-    if not tr.lastSeen or now - tr.lastSeen > TRACK_TTL then tracks[k] = nil end
+  local level = LEVELS[state]
+  return {
+    key = keyOf(sample),
+    name = sample.name or track.name or "UNKNOWN",
+    x = sample.x or 0,
+    y = sample.y or 0,
+    z = sample.z or 0,
+    d = d,
+    speed = speed,
+    closing = closing,
+    eta = eta,
+    sector = sector,
+    dot = dot,
+    state = state,
+    rank = rank,
+    color = level.color,
+  }
+end
+
+local function fakeContacts(now)
+  local t = now % 44
+  local list = {}
+
+  local scout = {id = "ghost-scout", name = "SCOUT", x = -680, y = 20, z = -920}
+  scout.distance = math.sqrt(scout.x * scout.x + scout.y * scout.y + scout.z * scout.z)
+  list[#list + 1] = scout
+
+  if t < 6 then
+    return list
+  elseif t < 14 then
+    local x, z = 1780, 1540
+    list[#list + 1] = {id = "hostile-1", name = "BOMBER", x = x, y = 36, z = z, distance = math.sqrt(x*x + 36*36 + z*z)}
+  elseif t < 24 then
+    local p = (t - 14) / 10
+    local x = 1780 - p * 780
+    local z = 1540 - p * 680
+    list[#list + 1] = {id = "hostile-1", name = "BOMBER", x = x, y = 35, z = z, distance = math.sqrt(x*x + 35*35 + z*z)}
+  elseif t < 32 then
+    local p = (t - 24) / 8
+    local x = 1000 - p * 520
+    local z = 860 - p * 460
+    list[#list + 1] = {id = "hostile-1", name = "BOMBER", x = x, y = 28, z = z, distance = math.sqrt(x*x + 28*28 + z*z)}
+  elseif t < 38 then
+    local p = (t - 32) / 6
+    local x = 480 - p * 240
+    local z = 400 - p * 200
+    list[#list + 1] = {id = "hostile-1", name = "BOMBER", x = x, y = 22, z = z, distance = math.sqrt(x*x + 22*22 + z*z)}
+  end
+
+  return list
+end
+
+local function collect(now)
+  local raw = TEST_MODE and fakeContacts(now) or radar.scanForSubLevels(RANGE)
+  local seen = {}
+  local out = {}
+
+  for _, sample in ipairs(raw or {}) do
+    sample.distance = sample.distance or math.sqrt((sample.x or 0)^2 + (sample.y or 0)^2 + (sample.z or 0)^2)
+    local k = keyOf(sample)
+    seen[k] = true
+    local t = ensureTrack(k)
+    updateHistory(t, sample, now)
+    out[#out + 1] = classify(t, sample)
+  end
+
+  for k, t in pairs(tracks) do
+    if not seen[k] and t.lastSeen and now - t.lastSeen > TRACK_TTL then
+      tracks[k] = nil
+    end
   end
 
   table.sort(out, function(a, b)
     if a.rank ~= b.rank then return a.rank > b.rank end
     return a.d < b.d
   end)
-  return out
-end
 
-local function scanTest(now)
-  local phase = now % 24
-  if phase >= 18 then return {} end
+  local top = out[1]
+  local state = top and top.state or "CLEAR"
+  local siren = top and top.rank >= 2 or false
+  if TEST_MODE and QUIET_TEST then siren = false end
 
-  local label, rank, d, closing, speed
-  if phase < 4 then
-    label, rank, d, closing, speed = "WATCH", 1, 1900, 0, 0
-  elseif phase < 9 then
-    label, rank = "INBOUND", 2
-    d = 1900 - (phase - 4) * 80
-    closing, speed = 80, 82
-  elseif phase < 14 then
-    label, rank = "HIGH", 3
-    d = 1200 - (phase - 9) * 110
-    closing, speed = 110, 112
-  else
-    label, rank = "CRIT", 4
-    d = math.max(120, 480 - (phase - 14) * 75)
-    closing, speed = 75, 78
+  if state ~= lastState then
+    pushLog("STATE " .. state)
+    lastState = state
+  end
+  if #out ~= lastCount then
+    pushLog("CONTACTS " .. tostring(#out))
+    lastCount = #out
+  end
+  if siren ~= lastSiren then
+    pushLog(siren and "SIREN ARMED" or "SIREN CLEAR")
+    lastSiren = siren
   end
 
-  local dx = SECTOR_X / SECTOR_LEN
-  local dz = SECTOR_Z / SECTOR_LEN
-  local eta = closing > 1 and d / closing or nil
-  return {{
-    key = "TEST",
-    name = "SIM",
-    x = dx * d,
-    y = 0,
-    z = dz * d,
-    d = d,
-    closing = closing,
-    speed = speed,
-    eta = eta,
-    sector = true,
-    samples = 8,
-    rank = rank,
-    label = label,
-  }}
+  return out, top, state, siren
 end
 
-local function overallStatus(current)
-  if #current == 0 then return 0, "CLEAR", C.green end
-  local top = current[1]
-  if top.rank >= 4 then return 4, "CRIT", C.red end
-  if top.rank == 3 then return 3, "HIGH", C.red end
-  if top.rank == 2 then return 2, "INBOUND", C.orange end
-  if top.rank == 1 then return 1, "WATCH", C.yellow end
-  return 0, "CLEAR", C.green
+local function drawRadarBox(x, y, size, contacts, top)
+  rect(x, y, size, size, C.panel)
+  outline(x, y, size, size, C.border)
+
+  local cx = x + math.floor(size / 2)
+  local cy = y + math.floor(size / 2)
+  local half = math.floor((size - 8) / 2)
+
+  for i = 1, 3 do
+    local o = math.floor(half * i / 3)
+    outline(cx - o, cy - o, o * 2, o * 2, C.grid)
+  end
+  line(cx - half, cy, cx + half, cy, C.grid)
+  line(cx, cy - half, cx, cy + half, C.grid)
+
+  local ang = math.atan(SECTOR_Z, SECTOR_X)
+  local spread = math.acos(SECTOR_COS)
+  local l1x = cx + math.cos(ang - spread) * half
+  local l1y = cy + math.sin(ang - spread) * half
+  local l2x = cx + math.cos(ang + spread) * half
+  local l2y = cy + math.sin(ang + spread) * half
+  line(cx, cy, l1x, l1y, C.darkGreen)
+  line(cx, cy, l2x, l2y, C.darkGreen)
+  txt(cx + math.cos(ang) * (half - 16), cy + math.sin(ang) * (half - 16), "RIVAL", C.yellow, 1)
+
+  rect(cx - 2, cy - 2, 4, 4, C.cyan)
+
+  for _, c in ipairs(contacts) do
+    local px = cx + math.floor((c.x / RANGE) * half)
+    local py = cy + math.floor((c.z / RANGE) * half)
+    local s = c == top and 6 or 4
+    rect(px - math.floor(s/2), py - math.floor(s/2), s, s, c.color)
+    if c == top then
+      outline(px - math.floor(s/2) - 2, py - math.floor(s/2) - 2, s + 4, s + 4, c.color)
+    end
+  end
+
+  txt(x + 5, y + 5, "SCAN FIELD", C.dim, 1)
+  txt(x + size - 34, y + size - 10, tostring(RANGE), C.dim, 1)
 end
 
-local function setSiren(on)
-  if TEST_MODE and QUIET_TEST then on = false end
-  rs.setOutput(SIREN_SIDE, on)
-end
-
-local function draw(current, alarm)
-  local rank, status, statusColor = overallStatus(current)
-  local top = current[1]
+local function drawFrame(state, contacts, top, siren)
+  local stateInfo = LEVELS[state] or {color = C.green}
+  if state == "CLEAR" then stateInfo = {color = C.green} end
 
   gpu.fill(C.bg)
 
-  -- Explicit system state. No fake rotating sweep: NeoRadar is a static volume scan.
-  rect(2, 2, W - 4, 11, rank >= 3 and C.darkred or C.panel2)
-  txt(5, 4, status, statusColor, 1)
-  txt(39, 4, alarm and "A:ON" or "A:OFF", alarm and C.red or C.dim, 1)
-  if TEST_MODE then txt(24, 4, "TEST", C.cyan, 1) end
-  rect(2, 12, W - 4, 1, statusColor)
+  local margin = 6
+  local headerH = 22
+  local footerH = 34
+  local sideW = 62
+  local gap = 6
+  local radarSize = math.min(H - headerH - footerH - margin * 2 - gap, W - sideW - margin * 2 - gap)
+  radarSize = math.max(96, radarSize)
+  local radarX = margin
+  local radarY = headerH + margin
+  local sideX = radarX + radarSize + gap
+  local sideY = radarY
+  local footerY = radarY + radarSize + gap
 
-  -- Static top-down coverage map. The square is truthful: NeoRadar scans an AABB.
-  local mx, my, mw, mh = 2, 16, 32, 32
-  rect(mx, my, mw, mh, C.panel)
-  outline(mx, my, mw, mh, C.border)
+  rect(margin, margin, W - margin * 2, headerH, C.panel2)
+  outline(margin, margin, W - margin * 2, headerH, C.border)
+  stripes(margin + 2, margin + 2, 42, headerH - 4)
+  stripes(W - margin - 44, margin + 2, 42, headerH - 4)
+  txt(margin + 48, margin + 4, "CRYSTALITE EARLY WARNING", C.text, 1)
+  txt(margin + 48, margin + 12, TEST_MODE and (QUIET_TEST and "TEST / QUIET" or "TEST / LIVE") or "LIVE SENSOR LINK", C.dim, 1)
 
-  local cx = mx + math.floor(mw / 2)
-  local cy = my + math.floor(mh / 2)
-  line(cx, my + 1, cx, my + mh - 2, C.grid)
-  line(mx + 1, cy, mx + mw - 2, cy, C.grid)
-  line(mx + 8, my + 1, mx + 8, my + mh - 2, C.grid)
-  line(mx + 24, my + 1, mx + 24, my + mh - 2, C.grid)
-  line(mx + 1, my + 8, mx + mw - 2, my + 8, C.grid)
-  line(mx + 1, my + 24, mx + mw - 2, my + 24, C.grid)
+  local pillW = 54
+  rect(sideX, margin + 4, pillW, 14, state == "CLEAR" and C.darkGreen or C.darkRed)
+  outline(sideX, margin + 4, pillW, 14, stateInfo.color)
+  txt(sideX + 6, margin + 7, state, stateInfo.color, 1)
+  txt(sideX + pillW + 8, margin + 7, siren and "A:ON" or "A:OFF", siren and C.red or C.green, 1)
 
-  -- Own position.
-  rect(cx - 1, cy - 1, 3, 3, C.cyan)
+  drawRadarBox(radarX, radarY, radarSize, contacts, top)
 
-  for _, c in ipairs(current) do
-    -- Raw NeoRadar x/z are mapped directly into the +/- RANGE square.
-    local px = cx + (c.x / RANGE) * (mw / 2 - 2)
-    local py = cy + (c.z / RANGE) * (mh / 2 - 2)
-    local col = C.green
-    if c.rank == 1 then col = C.yellow end
-    if c.rank == 2 then col = C.orange end
-    if c.rank >= 3 then col = C.red end
-    rect(px - 1, py - 1, 3, 3, col)
-    if c.rank >= 3 then outline(px - 2, py - 2, 5, 5, col) end
-  end
-
-  -- Compact 64x64 data panel.
-  local sx = 37
-  txt(sx, 17, "CONTACT", C.dim, 1)
-  txt(sx, 24, "C " .. tostring(#current), C.text, 1)
+  rect(sideX, sideY, sideW, 56, C.panel)
+  outline(sideX, sideY, sideW, 56, C.border)
+  txt(sideX + 5, sideY + 4, "PRIMARY THREAT", C.text, 1)
   if top then
-    txt(sx, 31, "D " .. tostring(math.floor(top.d + 0.5)), C.text, 1)
-    txt(sx, 38, string.format("V %+.0f", top.closing), top.closing > 1 and C.orange or C.dim, 1)
-    local eta = top.eta and (tostring(math.floor(top.eta + 0.5)) .. "s") or "--"
-    txt(sx, 45, "E " .. eta, C.text, 1)
+    txt(sideX + 5, sideY + 16, shortLabel(top.name, 10), top.color, 1)
+    txt(sideX + 5, sideY + 28, string.format("DIST %4.0f", top.d), C.text, 1)
+    txt(sideX + 5, sideY + 38, string.format("CLS  %+.1f/s", top.closing), top.closing > 0 and C.orange or C.cyan, 1)
+    txt(sideX + 5, sideY + 48, top.eta and string.format("ETA  %2.0fs", top.eta) or "ETA  --", C.text, 1)
   else
-    txt(sx, 31, "D --", C.dim, 1)
-    txt(sx, 38, "V --", C.dim, 1)
-    txt(sx, 45, "E --", C.dim, 1)
+    txt(sideX + 5, sideY + 20, "NO TRACKS", C.dim, 1)
+    txt(sideX + 5, sideY + 32, "AIRSPACE CLEAR", C.green, 1)
   end
 
-  txt(3, 52, "R2048", C.dim, 1)
-  txt(27, 52, radar and "SENSOR OK" or "SIM DATA", radar and C.green or C.cyan, 1)
-  txt(3, 59, alarm and "SIREN ON" or "SIREN OFF", alarm and C.red or C.dim, 1)
+  local sysY = sideY + 62
+  rect(sideX, sysY, sideW, 38, C.panel)
+  outline(sideX, sysY, sideW, 38, C.border)
+  txt(sideX + 5, sysY + 4, "SYSTEM", C.text, 1)
+  txt(sideX + 5, sysY + 16, "RADAR " .. (TEST_MODE and "SIM" or "OK"), TEST_MODE and C.yellow or C.green, 1)
+  txt(sideX + 5, sysY + 26, string.format("DSP %dx%d", W, H), C.dim, 1)
+  txt(sideX + 34, sysY + 26, shortLabel(gpuSide, 6), C.dim, 1)
+
+  local listY = sysY + 44
+  local listH = radarY + radarSize - listY
+  rect(sideX, listY, sideW, listH, C.panel)
+  outline(sideX, listY, sideW, listH, C.border)
+  txt(sideX + 5, listY + 4, "TRACK LIST", C.text, 1)
+  for i = 1, math.min(6, #contacts) do
+    local c = contacts[i]
+    local yy = listY + 10 + (i - 1) * 14
+    rect(sideX + 4, yy, 6, 6, c.color)
+    txt(sideX + 14, yy - 1, shortLabel(c.name, 7), C.text, 1)
+    txt(sideX + sideW - 22, yy - 1, string.format("%3.0f", c.d), C.dim, 1)
+  end
+
+  rect(margin, footerY, W - margin * 2, footerH, C.panel2)
+  outline(margin, footerY, W - margin * 2, footerH, C.border)
+  stripes(margin + 4, footerY + 4, 28, footerH - 8)
+  txt(margin + 36, footerY + 5, siren and "SIREN ACTIVE" or "SIREN STANDBY", siren and C.red or C.green, 1)
+  txt(margin + 36, footerY + 15, string.format("CONTACTS %d   RANGE %d", #contacts, RANGE), C.dim, 1)
+  txt(W - 70, footerY + 5, textutils.formatTime(os.time(), true), C.text, 1)
+  txt(W - 70, footerY + 15, TEST_MODE and "SIMULATED" or "LIVE", TEST_MODE and C.yellow or C.cyan, 1)
+  bar(W - 70, footerY + 22, 56, 8, math.min(1, #contacts / 6), stateInfo.color, C.panel3)
+
+  for i = 1, math.min(3, #logs) do
+    txt(margin + 36, footerY + 23 + (i - 1) * 9, shortLabel(logs[i] or "", 40), C.dim, 1)
+  end
 
   gpu.sync()
 end
 
-local lastScan = -100
-local function main()
-  rs.setOutput(SIREN_SIDE, false)
-  while true do
-    local now = nowSeconds()
-    if now - lastScan >= SCAN_INTERVAL then
-      rows = TEST_MODE and scanTest(now) or scanReal(now)
-      lastScan = now
-    end
-
-    local alarm = (#rows > 0 and rows[1].rank >= 2)
-    setSiren(alarm)
-    draw(rows, alarm and not (TEST_MODE and QUIET_TEST))
-    sleep(0.15)
-  end
+while true do
+  local now = os.epoch("utc") / 1000
+  local contacts, top, state, siren = collect(now)
+  rs.setOutput(SIREN_SIDE, siren)
+  drawFrame(state, contacts, top, siren)
+  sleep(SCAN_INTERVAL)
 end
-
-local ok, err = pcall(main)
-rs.setOutput(SIREN_SIDE, false)
-if not ok then error(err, 0) end
