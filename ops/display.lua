@@ -9,8 +9,7 @@ local SCAN_INTERVAL = 0.75
 local HISTORY = 8
 local TRACK_TTL = 8
 
--- Shared origin used to convert personnel sensor world coordinates into the
--- same local coordinate system used by the sublevel sensor.
+-- Personnel sensor world origin, aligned with the sublevel sensor local frame.
 local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442
 
 -- Monitored direction in local sensor coordinates.
@@ -18,12 +17,16 @@ local SECTOR_X, SECTOR_Z = 1881, 1632
 local SECTOR_LEN = math.sqrt(SECTOR_X * SECTOR_X + SECTOR_Z * SECTOR_Z)
 local SECTOR_COS = 0.70
 
--- Personnel warning thresholds. Normal sprinting should generally stay below
--- these values; fast vehicles / unusual movement should not.
+-- Fast-person warning thresholds.
 local PERSON_MIN_DISTANCE = 64
 local PERSON_MIN_SPEED = 8
 local PERSON_MIN_CLOSING = 6
 local PERSON_MIN_SAMPLES = 3
+
+-- 3x3 wall list behavior. Every contact is always plotted on the map; the
+-- detail lists page automatically when there are too many rows to fit.
+local LIST_ROWS = 3
+local LIST_PAGE_SECONDS = 3
 
 local function nowSeconds()
   return os.epoch("utc") / 1000
@@ -176,13 +179,7 @@ end
 
 local function addSample(track, sample, now)
   local h = track.history
-  h[#h + 1] = {
-    t = now,
-    d = sample.d,
-    x = sample.x,
-    y = sample.y,
-    z = sample.z,
-  }
+  h[#h + 1] = {t = now, d = sample.d, x = sample.x, y = sample.y, z = sample.z}
   while #h > HISTORY do table.remove(h, 1) end
   track.lastSeen = now
 end
@@ -302,8 +299,6 @@ local function scanPeople(now)
   local rows = {}
 
   for i, v in ipairs(raw) do
-    -- The personnel sensor returns world coordinates. Convert them so they
-    -- overlay directly on the same map as the sublevel sensor.
     local lx = ORIGIN_X - (v.x or ORIGIN_X)
     local ly = ORIGIN_Y - (v.y or ORIGIN_Y)
     local lz = ORIGIN_Z - (v.z or ORIGIN_Z)
@@ -342,51 +337,42 @@ local function scanPeople(now)
 end
 
 local function testData(now)
-  local phase = now % 52
+  local phase = now % 56
   local subs, people = {}, {}
   local dx = SECTOR_X / SECTOR_LEN
   local dz = SECTOR_Z / SECTOR_LEN
 
-  if phase < 6 or phase >= 48 then
+  if phase < 6 or phase >= 52 then
     return subs, people
-  elseif phase < 12 then
-    people[1] = {
-      kind = "person", name = "TESTER", x = -360, y = 0, z = -260,
-      d = 444, speed = 2, closing = 1, eta = nil, warning = false, rank = 0, state = "PERSON",
-    }
-  elseif phase < 20 then
-    local d = 850 - (phase - 12) * 45
-    people[1] = {
-      kind = "person", name = "RUNNER", x = dx * d, y = 0, z = dz * d,
-      d = d, speed = 48, closing = 45, eta = d / 45, warning = true, rank = 1, state = "FAST IN",
-    }
-  elseif phase < 28 then
-    local d = 1700 - (phase - 20) * 70
-    subs[1] = {
-      kind = "sub", name = "AIRCRAFT", x = dx * d, y = 20, z = dz * d,
-      d = d, speed = 73, closing = 70, eta = d / 70,
-      sector = true, rank = 2, state = "INBOUND",
-    }
-  elseif phase < 40 then
-    local d1 = 1150 - (phase - 28) * 55
-    local d2 = 780 - (phase - 28) * 35
-    subs[1] = {
-      kind = "sub", name = "AIRCRAFT", x = dx * d1, y = 20, z = dz * d1,
-      d = d1, speed = 58, closing = 55, eta = d1 / 55,
-      sector = true, rank = d1 < 600 and 4 or 2, state = d1 < 600 and "CRIT" or "INBOUND",
-    }
-    people[1] = {
-      kind = "person", name = "RIDER", x = dx * d2, y = 0, z = dz * d2,
-      d = d2, speed = 38, closing = 35, eta = d2 / 35,
-      warning = true, rank = 1, state = "FAST IN",
-    }
-  else
-    local d = math.max(180, 460 - (phase - 40) * 60)
-    subs[1] = {
-      kind = "sub", name = "AIRCRAFT", x = dx * d, y = 20, z = dz * d,
-      d = d, speed = 63, closing = 60, eta = d / 60,
-      sector = true, rank = 4, state = "CRIT",
-    }
+  end
+
+  people[1] = {kind="person", name="ALPHA", x=-420, y=0, z=-260, d=494, speed=2, closing=1, warning=false, rank=0, state="PERSON"}
+  people[2] = {kind="person", name="BRAVO", x=260, y=0, z=-580, d=636, speed=3, closing=-1, warning=false, rank=0, state="PERSON"}
+  people[3] = {kind="person", name="CHARLIE", x=-180, y=0, z=340, d=385, speed=1, closing=0, warning=false, rank=0, state="PERSON"}
+  people[4] = {kind="person", name="DELTA", x=520, y=0, z=220, d=565, speed=2, closing=0, warning=false, rank=0, state="PERSON"}
+  people[5] = {kind="person", name="ECHO", x=-610, y=0, z=120, d=622, speed=2, closing=0, warning=false, rank=0, state="PERSON"}
+
+  subs[1] = {kind="sub", name="CARGO", x=-1100, y=10, z=-720, d=1315, speed=0, closing=0, eta=nil, sector=false, rank=0, state="CONTACT"}
+  subs[2] = {kind="sub", name="SCOUT", x=720, y=15, z=-980, d=1217, speed=0, closing=0, eta=nil, sector=false, rank=0, state="CONTACT"}
+  subs[3] = {kind="sub", name="HAULER", x=-820, y=5, z=1030, d=1317, speed=0, closing=0, eta=nil, sector=false, rank=0, state="CONTACT"}
+  subs[4] = {kind="sub", name="DRONE", x=930, y=25, z=930, d=1316, speed=0, closing=0, eta=nil, sector=true, rank=1, state="WATCH"}
+  subs[5] = {kind="sub", name="AIR-2", x=1120, y=25, z=970, d=1482, speed=0, closing=0, eta=nil, sector=true, rank=1, state="WATCH"}
+
+  if phase >= 14 then
+    local d = 850 - math.min(10, phase - 14) * 45
+    people[1].x, people[1].z = dx * d, dz * d
+    people[1].d = d
+    people[1].speed, people[1].closing = 48, 45
+    people[1].eta = d / 45
+    people[1].warning, people[1].rank, people[1].state = true, 1, "FAST IN"
+  end
+
+  if phase >= 24 then
+    local d = 1700 - math.min(12, phase - 24) * 70
+    subs[4].x, subs[4].z = dx * d, dz * d
+    subs[4].d = d
+    subs[4].speed, subs[4].closing, subs[4].eta = 73, 70, d / 70
+    subs[4].rank, subs[4].state = d < 600 and 4 or (d < 1200 and 3 or 2), d < 600 and "CRIT" or (d < 1200 and "HIGH" or "INBOUND")
   end
 
   return subs, people
@@ -402,22 +388,30 @@ local function summarize(subs, people)
   local siren = combined or subSevere
 
   if topSub and topSub.rank >= 4 then
-    return "CRITICAL", "IMMEDIATE CONTRAPTION THREAT", C.magenta, C.critical, siren, combined
+    return "CRITICAL", "IMMEDIATE CONTRAPTION THREAT", C.magenta, C.critical, siren
   elseif combined then
-    return "ALARM", "PERSON + CONTRAPTION APPROACH", C.red, C.alertBg, siren, true
+    return "ALARM", "PERSON + CONTRAPTION APPROACH", C.red, C.alertBg, siren
   elseif topSub and topSub.rank >= 3 then
-    return "HIGH", "CONTRAPTION THREAT", C.red, C.alertBg, siren, false
+    return "HIGH", "CONTRAPTION THREAT", C.red, C.alertBg, siren
   elseif personWarning then
-    return "WARNING", "FAST PERSON APPROACHING", C.orange, C.watchBg, false, false
+    return "WARNING", "FAST PERSON APPROACHING", C.orange, C.watchBg, false
   elseif subInbound then
-    return "INBOUND", "CONTRAPTION APPROACHING", C.orange, C.watchBg, false, false
+    return "INBOUND", "CONTRAPTION APPROACHING", C.orange, C.watchBg, false
   elseif topSub and topSub.rank == 1 then
-    return "WATCH", "CONTRAPTION IN WATCH SECTOR", C.yellow, C.watchBg, false, false
+    return "WATCH", "CONTRAPTION IN WATCH SECTOR", C.yellow, C.watchBg, false
   elseif #subs > 0 or #people > 0 then
-    return "CONTACT", tostring(#people) .. " PERSON / " .. tostring(#subs) .. " CONTRAP", C.cyan, C.infoBg, false, false
+    return "CONTACT", tostring(#people) .. " PERSON / " .. tostring(#subs) .. " CONTRAP", C.cyan, C.infoBg, false
   else
-    return "CLEAR", "NO DETECTIONS", C.green, C.clearBg, false, false
+    return "CLEAR", "NO DETECTIONS", C.green, C.clearBg, false
   end
+end
+
+local function subColor(c)
+  if c.rank >= 4 then return C.magenta end
+  if c.rank == 3 then return C.red end
+  if c.rank == 2 then return C.orange end
+  if c.rank == 1 then return C.yellow end
+  return C.cyan
 end
 
 local function drawPersonMarker(px, py, color, warning)
@@ -427,10 +421,29 @@ local function drawPersonMarker(px, py, color, warning)
   if warning then outline(px - 5, py - 5, 10, 10, color) end
 end
 
+local COLLISION_OFFSETS = {
+  {0,0}, {5,0}, {-5,0}, {0,5}, {0,-5},
+  {5,5}, {-5,5}, {5,-5}, {-5,-5}, {8,0}, {-8,0},
+}
+
+local function reserveMarker(px, py, occupied, minX, minY, maxX, maxY)
+  local bx, by = math.floor(px + 0.5), math.floor(py + 0.5)
+  for _, off in ipairs(COLLISION_OFFSETS) do
+    local x = clamp(bx + off[1], minX, maxX)
+    local y = clamp(by + off[2], minY, maxY)
+    local key = tostring(math.floor(x / 4)) .. ":" .. tostring(math.floor(y / 4))
+    if not occupied[key] then
+      occupied[key] = true
+      return x, y
+    end
+  end
+  return bx, by
+end
+
 local function drawCoverage(x, y, w, h, subs, people)
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
-  txt(x + 5, y + 4, "COVERAGE", C.dim, 1)
+  txt(x + 5, y + 4, "ALL TRACKS", C.dim, 1)
 
   local mapX = x + 5
   local mapY = y + 15
@@ -450,14 +463,12 @@ local function drawCoverage(x, y, w, h, subs, people)
     line(mapX + 1, gy, mapX + mapW - 2, gy, C.grid)
   end
 
-  -- Inner box is the smaller personnel sensor range.
   local personFrac = PERSON_RANGE / CONTRAPTION_RANGE
   local pw = math.floor(mapW * personFrac)
   local ph = math.floor(mapH * personFrac)
   outline(cx - math.floor(pw / 2), cy - math.floor(ph / 2), pw, ph, C.blue)
   txt(cx - math.floor(pw / 2) + 3, cy - math.floor(ph / 2) + 3, "P1024", C.blue, 1)
 
-  -- Static monitored-sector boundaries.
   local ang = math.atan(SECTOR_Z, SECTOR_X)
   local spread = math.acos(SECTOR_COS)
   local radius = math.min(mapW, mapH) / 2 - 3
@@ -466,61 +477,88 @@ local function drawCoverage(x, y, w, h, subs, people)
 
   rect(cx - 2, cy - 2, 4, 4, C.green)
 
-  for _, c in ipairs(subs) do
-    local px = cx + clamp(c.x / CONTRAPTION_RANGE, -1, 1) * (mapW / 2 - 5)
-    local py = cy + clamp(c.z / CONTRAPTION_RANGE, -1, 1) * (mapH / 2 - 5)
-    local color = C.cyan
-    if c.rank == 1 then color = C.yellow end
-    if c.rank == 2 then color = C.orange end
-    if c.rank == 3 then color = C.red end
-    if c.rank >= 4 then color = C.magenta end
+  local occupied = {}
+  local minPX, minPY = mapX + 4, mapY + 4
+  local maxPX, maxPY = mapX + mapW - 5, mapY + mapH - 5
+
+  for i, c in ipairs(subs) do
+    local rawX = cx + clamp(c.x / CONTRAPTION_RANGE, -1, 1) * (mapW / 2 - 5)
+    local rawY = cy + clamp(c.z / CONTRAPTION_RANGE, -1, 1) * (mapH / 2 - 5)
+    local px, py = reserveMarker(rawX, rawY, occupied, minPX, minPY, maxPX, maxPY)
+    local color = subColor(c)
     rect(px - 2, py - 2, 5, 5, color)
+    if i <= 9 then txt(px + 4, py - 3, "C" .. tostring(i), color, 1) end
   end
 
   for i, p in ipairs(people) do
-    local px = cx + clamp(p.x / CONTRAPTION_RANGE, -1, 1) * (mapW / 2 - 5)
-    local py = cy + clamp(p.z / CONTRAPTION_RANGE, -1, 1) * (mapH / 2 - 5)
+    local rawX = cx + clamp(p.x / CONTRAPTION_RANGE, -1, 1) * (mapW / 2 - 5)
+    local rawY = cy + clamp(p.z / CONTRAPTION_RANGE, -1, 1) * (mapH / 2 - 5)
+    local px, py = reserveMarker(rawX, rawY, occupied, minPX, minPY, maxPX, maxPY)
     local color = p.warning and C.orange or C.blue
     drawPersonMarker(px, py, color, p.warning)
-    if i <= 4 then txt(px + 4, py - 3, short(p.name, 5), color, 1) end
+    if i <= 9 then txt(px + 4, py - 3, "P" .. tostring(i), color, 1) end
   end
 
-  txt(x + 5, y + h - 10, "SQUARE  +/-2048", C.dim, 1)
+  txt(x + 5, y + h - 10, "P+  C#   +/-2048", C.dim, 1)
 end
 
-local function drawSide(x, y, w, h, subs, people)
+local function pageInfo(count, now)
+  if count <= LIST_ROWS then return 1, 1, 1, count end
+  local pages = math.ceil(count / LIST_ROWS)
+  local page = (math.floor(now / LIST_PAGE_SECONDS) % pages) + 1
+  local first = (page - 1) * LIST_ROWS + 1
+  local last = math.min(count, first + LIST_ROWS - 1)
+  return page, pages, first, last
+end
+
+local function drawTrackList(x, y, w, title, prefix, rows, now, isPerson)
+  local page, pages, first, last = pageInfo(#rows, now)
+  txt(x + 4, y, title .. " " .. tostring(#rows), C.dim, 1)
+  if pages > 1 then txt(x + w - 25, y, tostring(page) .. "/" .. tostring(pages), C.dim, 1) end
+
+  if #rows == 0 then
+    txt(x + 4, y + 12, "NONE", C.green, 1)
+    return
+  end
+
+  local rowY = y + 11
+  for i = first, last do
+    local r = rows[i]
+    local localIndex = i - first
+    local yy = rowY + localIndex * 9
+    local color
+    if isPerson then
+      color = r.warning and C.orange or C.blue
+    else
+      color = subColor(r)
+    end
+
+    txt(x + 4, yy, prefix .. tostring(i), color, 1)
+    if isPerson then
+      txt(x + 19, yy, short(r.name, 7), color, 1)
+      txt(x + w - 25, yy, tostring(math.floor(r.d + 0.5)), C.dim, 1)
+    else
+      txt(x + 19, yy, short(r.state, 6), color, 1)
+      txt(x + w - 25, yy, tostring(math.floor(r.d + 0.5)), C.dim, 1)
+    end
+  end
+end
+
+local function drawSide(x, y, w, h, subs, people, now)
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
 
-  txt(x + 5, y + 4, "DETECTIONS", C.dim, 1)
+  txt(x + 5, y + 4, "DETECTIONS", C.text, 1)
   txt(x + 5, y + 15, "P " .. tostring(#people), #people > 0 and C.blue or C.dim, 1)
-  txt(x + 35, y + 15, "C " .. tostring(#subs), #subs > 0 and C.cyan or C.dim, 1)
-
+  txt(x + 38, y + 15, "C " .. tostring(#subs), #subs > 0 and C.cyan or C.dim, 1)
   line(x + 4, y + 27, x + w - 5, y + 27, C.border)
-  txt(x + 5, y + 32, "PERSON", C.dim, 1)
-  local p = people[1]
-  if p then
-    txt(x + 5, y + 43, short(p.name, 9), p.warning and C.orange or C.blue, 1)
-    txt(x + 5, y + 54, p.warning and "FAST IN" or "TRACKED", p.warning and C.orange or C.text, 1)
-    txt(x + 5, y + 65, string.format("V%.0f C%+.0f", p.speed, p.closing), p.warning and C.orange or C.dim, 1)
-  else
-    txt(x + 5, y + 45, "NONE", C.green, 1)
-  end
 
-  line(x + 4, y + 77, x + w - 5, y + 77, C.border)
-  txt(x + 5, y + 82, "CONTRAP", C.dim, 1)
-  local c = subs[1]
-  if c then
-    local color = C.cyan
-    if c.rank == 1 then color = C.yellow end
-    if c.rank == 2 then color = C.orange end
-    if c.rank == 3 then color = C.red end
-    if c.rank >= 4 then color = C.magenta end
-    txt(x + 5, y + 93, c.state, color, 1)
-    txt(x + 5, y + 104, string.format("D%.0f C%+.0f", c.d, c.closing), C.text, 1)
-  else
-    txt(x + 5, y + 95, "NONE", C.green, 1)
-  end
+  local sectionY = y + 32
+  drawTrackList(x, sectionY, w, "PLAYERS", "P", people, now, true)
+
+  local dividerY = sectionY + 40
+  line(x + 4, dividerY, x + w - 5, dividerY, C.border)
+  drawTrackList(x, dividerY + 5, w, "CONTRAPS", "C", subs, now, false)
 end
 
 local function drawHeader(status, message, color, bg)
@@ -540,12 +578,12 @@ local function drawFooter(sirenOn)
   txt(x + 5, y + 4, TEST_MODE and (QUIET_TEST and "TEST QUIET" or "TEST") or "LIVE", TEST_MODE and C.yellow or C.green, 1)
   txt(x + 55, y + 4, sirenOn and "SIREN ON" or "SIREN OFF", sirenOn and C.red or C.dim, 1)
   txt(x + 119, y + 4, (subSensor and "C+" or "C-") .. " " .. (personSensor and "P+" or "P-"), C.dim, 1)
-  txt(x + 5, y + 13, "+ PERSON   # CONTRAP", C.dim, 1)
+  txt(x + 5, y + 13, "ALL MAP / LISTS PAGE", C.dim, 1)
   txt(x + w - 49, y + 13, textutils.formatTime(os.time(), true), C.text, 1)
 end
 
-local function draw(subs, people, sirenOn)
-  local status, message, color, bg, autoSiren, combined = summarize(subs, people)
+local function draw(subs, people, sirenOn, now)
+  local status, message, color, bg, autoSiren = summarize(subs, people)
   sirenOn = sirenOn and autoSiren
 
   gpu.fill(C.bg)
@@ -554,11 +592,11 @@ local function draw(subs, people, sirenOn)
   local bodyY = 46
   local footerY = H - 32
   local bodyH = footerY - bodyY
-  local sideW = 66
+  local sideW = 78
   local gap = 6
   local mapW = W - 12 - sideW - gap
   drawCoverage(6, bodyY, mapW, bodyH, subs, people)
-  drawSide(6 + mapW + gap, bodyY, sideW, bodyH, subs, people)
+  drawSide(6 + mapW + gap, bodyY, sideW, bodyH, subs, people, now)
   drawFooter(sirenOn)
   gpu.sync()
 end
@@ -570,6 +608,14 @@ local function main()
     local subs, people
     if TEST_MODE then
       subs, people = testData(now)
+      table.sort(subs, function(a, b)
+        if a.rank ~= b.rank then return a.rank > b.rank end
+        return a.d < b.d
+      end)
+      table.sort(people, function(a, b)
+        if a.warning ~= b.warning then return a.warning end
+        return a.d < b.d
+      end)
     else
       subs = scanSubs(now)
       people = scanPeople(now)
@@ -578,7 +624,7 @@ local function main()
     local _, _, _, _, shouldSiren = summarize(subs, people)
     local physicalSiren = shouldSiren and not (TEST_MODE and QUIET_TEST)
     rs.setOutput(SIREN_SIDE, physicalSiren)
-    draw(subs, people, physicalSiren)
+    draw(subs, people, physicalSiren, now)
     sleep(SCAN_INTERVAL)
   end
 end
