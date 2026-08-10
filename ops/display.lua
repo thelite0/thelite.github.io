@@ -2,22 +2,33 @@ local args = {...}
 local TEST_MODE = args[1] == "test"
 local QUIET_TEST = args[2] == "quiet"
 
-local RANGE = 2048
+local CONTRAPTION_RANGE = 2048
+local PERSON_RANGE = 1024
 local SIREN_SIDE = "back"
-local SCAN_INTERVAL = 1.0
+local SCAN_INTERVAL = 0.75
 local HISTORY = 8
-local TRACK_TTL = 12
+local TRACK_TTL = 8
+
+-- Shared origin used to convert personnel sensor world coordinates into the
+-- same local coordinate system used by the sublevel sensor.
+local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442
 
 -- Monitored direction in local sensor coordinates.
 local SECTOR_X, SECTOR_Z = 1881, 1632
 local SECTOR_LEN = math.sqrt(SECTOR_X * SECTOR_X + SECTOR_Z * SECTOR_Z)
 local SECTOR_COS = 0.70
 
+-- Personnel warning thresholds. Normal sprinting should generally stay below
+-- these values; fast vehicles / unusual movement should not.
+local PERSON_MIN_DISTANCE = 64
+local PERSON_MIN_SPEED = 8
+local PERSON_MIN_CLOSING = 6
+local PERSON_MIN_SAMPLES = 3
+
 local function nowSeconds()
   return os.epoch("utc") / 1000
 end
 
--- Find the display controller regardless of attachment side.
 local gpu, gpuSide
 for _, name in ipairs(peripheral.getNames()) do
   local p = peripheral.wrap(name)
@@ -26,9 +37,8 @@ for _, name in ipairs(peripheral.getNames()) do
     break
   end
 end
-assert(gpu, "compatible display controller not found")
+assert(gpu, "display controller not found")
 
--- Display size refresh is asynchronous.
 local W, H = 0, 0
 for _ = 1, 30 do
   gpu.refreshSize()
@@ -36,21 +46,21 @@ for _ = 1, 30 do
   W, H = gpu.getSize()
   if type(W) == "number" and type(H) == "number" and W > 0 and H > 0 then break end
 end
-assert(W > 0 and H > 0, "no bitmap display detected by GPU")
+assert(W > 0 and H > 0, "display not detected")
 
 gpu.setSize(64)
 sleep(0.1)
 W, H = gpu.getSize()
 
-local radar
+local subSensor, personSensor
 for _, name in ipairs(peripheral.getNames()) do
   local p = peripheral.wrap(name)
-  if p and type(p.scanForSubLevels) == "function" then
-    radar = p
-    break
+  if p then
+    if not subSensor and type(p.scanForSubLevels) == "function" then subSensor = p end
+    if not personSensor and type(p.scanForPlayers) == "function" then personSensor = p end
   end
 end
-if not TEST_MODE then assert(radar, "sensor not found") end
+if not TEST_MODE then assert(subSensor, "sublevel sensor not found") end
 
 local C = {
   bg       = 0xFF05090C,
@@ -58,17 +68,20 @@ local C = {
   panel2   = 0xFF101B20,
   border   = 0xFF31515A,
   grid     = 0xFF183138,
-  text     = 0xFFE5EFF2,
-  dim      = 0xFF73868D,
+  text     = 0xFFE7F0F2,
+  dim      = 0xFF758990,
   cyan     = 0xFF49D9F2,
+  blue     = 0xFF6AA6FF,
   green    = 0xFF4FE39B,
   yellow   = 0xFFF0D15A,
   orange   = 0xFFFF9D3A,
   red      = 0xFFFF5C68,
   magenta  = 0xFFFF69CF,
   clearBg  = 0xFF10291E,
+  infoBg   = 0xFF10232B,
   watchBg  = 0xFF312A12,
   alertBg  = 0xFF35161A,
+  critical = 0xFF48131C,
   hazardA  = 0xFFF0C94B,
   hazardB  = 0xFF171717,
 }
@@ -122,11 +135,15 @@ end
 local function txtCentered(y, s, c, size, x, w)
   x = x or 0
   w = w or W
-  local px = x + math.floor((w - textWidth(s, size)) / 2)
-  txt(px, y, s, c, size)
+  txt(x + math.floor((w - textWidth(s, size)) / 2), y, s, c, size)
 end
 
--- Rectangular warning rail. Unlike diagonal primitives, this stays inside its panel.
+local function short(s, n)
+  s = tostring(s or "UNKNOWN")
+  if #s <= n then return s end
+  return s:sub(1, math.max(1, n - 3)) .. "..."
+end
+
 local function hazardRail(x, y, w, h)
   rect(x, y, w, h, C.hazardB)
   local cell = 8
@@ -139,52 +156,39 @@ local function hazardRail(x, y, w, h)
   end
 end
 
-local function short(s, n)
-  s = tostring(s or "UNKNOWN")
-  if #s <= n then return s end
-  return s:sub(1, math.max(1, n - 3)) .. "..."
-end
-
-local function keyOf(v)
-  if type(v.id) == "table" then
-    local parts = {}
-    for _, k in ipairs(v.id) do parts[#parts + 1] = tostring(k) end
-    if #parts > 0 then return table.concat(parts, ":") end
-  elseif v.id ~= nil then
-    return tostring(v.id)
-  end
-  return tostring(v.name or "CONTACT") .. "@" .. math.floor(v.x or 0) .. ":" .. math.floor(v.z or 0)
-end
-
 local function inSector(x, z)
   local h = math.sqrt(x * x + z * z)
   if h < 1 then return false end
   return (x * SECTOR_X + z * SECTOR_Z) / (h * SECTOR_LEN) >= SECTOR_COS
 end
 
-local tracks = {}
+local function localDistance(x, y, z)
+  return math.sqrt(x * x + y * y + z * z)
+end
 
-local function ensureTrack(key)
-  if not tracks[key] then tracks[key] = {history = {}} end
-  return tracks[key]
+local subTracks = {}
+local personTracks = {}
+
+local function ensureTrack(store, key)
+  if not store[key] then store[key] = {history = {}} end
+  return store[key]
 end
 
 local function addSample(track, sample, now)
   local h = track.history
   h[#h + 1] = {
     t = now,
-    d = sample.distance or 0,
-    x = sample.x or 0,
-    y = sample.y or 0,
-    z = sample.z or 0,
+    d = sample.d,
+    x = sample.x,
+    y = sample.y,
+    z = sample.z,
   }
   while #h > HISTORY do table.remove(h, 1) end
   track.lastSeen = now
 end
 
--- Regression smooths sensor jitter better than a one-sample delta.
 local function closingRate(h)
-  if #h < 4 then return 0 end
+  if #h < 2 then return 0 end
   local t0 = h[1].t
   local n, st, sd, stt, std = #h, 0, 0, 0, 0
   for _, p in ipairs(h) do
@@ -208,16 +212,31 @@ local function totalSpeed(h)
   return math.sqrt(dx * dx + dy * dy + dz * dz) / dt
 end
 
-local function classify(row, sampleCount)
+local function cleanup(store, now)
+  for key, tr in pairs(store) do
+    if not tr.lastSeen or now - tr.lastSeen > TRACK_TTL then store[key] = nil end
+  end
+end
+
+local function subKey(v)
+  if type(v.id) == "table" then
+    local parts = {}
+    for _, k in ipairs(v.id) do parts[#parts + 1] = tostring(k) end
+    if #parts > 0 then return table.concat(parts, ":") end
+  elseif v.id ~= nil then
+    return tostring(v.id)
+  end
+  return tostring(v.name or "SUB") .. "@" .. math.floor(v.x or 0) .. ":" .. math.floor(v.z or 0)
+end
+
+local function classifySub(row, samples)
   row.rank = 0
   row.state = "CONTACT"
-
   if row.sector then
     row.rank = 1
     row.state = "WATCH"
-
     local threshold = row.d > 1500 and 10 or row.d > 900 and 6 or 3
-    if sampleCount >= 4 and row.closing > threshold then
+    if samples >= 4 and row.closing > threshold then
       row.rank = 2
       row.state = "INBOUND"
       if row.d < 1200 or (row.eta and row.eta < 70) then
@@ -232,41 +251,38 @@ local function classify(row, sampleCount)
   end
 end
 
-local function scanReal(now)
-  local raw = radar.scanForSubLevels(RANGE) or {}
-  local seen = {}
+local function scanSubs(now)
+  if not subSensor then return {} end
+  local ok, raw = pcall(function() return subSensor.scanForSubLevels(CONTRAPTION_RANGE) end)
+  if not ok or type(raw) ~= "table" then return {} end
   local rows = {}
 
   for _, v in ipairs(raw) do
-    v.distance = v.distance or math.sqrt((v.x or 0)^2 + (v.y or 0)^2 + (v.z or 0)^2)
-    local key = keyOf(v)
-    seen[key] = true
-    local tr = ensureTrack(key)
-    addSample(tr, v, now)
-
-    local closing = closingRate(tr.history)
-    local row = {
-      key = key,
-      name = v.name or "UNKNOWN",
+    local sample = {
       x = v.x or 0,
       y = v.y or 0,
       z = v.z or 0,
-      d = v.distance,
+      d = v.distance or localDistance(v.x or 0, v.y or 0, v.z or 0),
+    }
+    local key = subKey(v)
+    local tr = ensureTrack(subTracks, key)
+    addSample(tr, sample, now)
+    local closing = closingRate(tr.history)
+    local row = {
+      kind = "sub",
+      key = key,
+      name = v.name or "CONTRAP",
+      x = sample.x, y = sample.y, z = sample.z, d = sample.d,
       closing = closing,
       speed = totalSpeed(tr.history),
-      eta = closing > 1 and (v.distance / closing) or nil,
-      sector = inSector(v.x or 0, v.z or 0),
+      eta = closing > 1 and sample.d / closing or nil,
+      sector = inSector(sample.x, sample.z),
     }
-    classify(row, #tr.history)
+    classifySub(row, #tr.history)
     rows[#rows + 1] = row
   end
 
-  for key, tr in pairs(tracks) do
-    if not seen[key] and tr.lastSeen and now - tr.lastSeen > TRACK_TTL then
-      tracks[key] = nil
-    end
-  end
-
+  cleanup(subTracks, now)
   table.sort(rows, function(a, b)
     if a.rank ~= b.rank then return a.rank > b.rank end
     return a.d < b.d
@@ -274,76 +290,147 @@ local function scanReal(now)
   return rows
 end
 
--- Full test cycle: CLEAR -> CONTACT -> WATCH -> INBOUND -> HIGH -> CRIT -> CLEAR.
-local function scanTest(now)
-  local phase = now % 48
-  if phase < 6 or phase >= 42 then return {} end
+local function personKey(v, index)
+  if v.username and v.username ~= "" then return tostring(v.username) end
+  return "PERSON-" .. tostring(index)
+end
 
-  if phase < 12 then
-    return {{
-      key = "TEST-SCOUT", name = "SCOUT", x = -900, y = 20, z = -700,
-      d = 1140, closing = 0, speed = 0, eta = nil,
-      sector = false, rank = 0, state = "CONTACT",
-    }}
+local function scanPeople(now)
+  if not personSensor then return {} end
+  local ok, raw = pcall(function() return personSensor.scanForPlayers(PERSON_RANGE) end)
+  if not ok or type(raw) ~= "table" then return {} end
+  local rows = {}
+
+  for i, v in ipairs(raw) do
+    -- The personnel sensor returns world coordinates. Convert them so they
+    -- overlay directly on the same map as the sublevel sensor.
+    local lx = ORIGIN_X - (v.x or ORIGIN_X)
+    local ly = ORIGIN_Y - (v.y or ORIGIN_Y)
+    local lz = ORIGIN_Z - (v.z or ORIGIN_Z)
+    local d = localDistance(lx, ly, lz)
+    local sample = {x = lx, y = ly, z = lz, d = d}
+    local key = personKey(v, i)
+    local tr = ensureTrack(personTracks, key)
+    addSample(tr, sample, now)
+    local closing = closingRate(tr.history)
+    local speed = totalSpeed(tr.history)
+    local warning = #tr.history >= PERSON_MIN_SAMPLES
+      and d >= PERSON_MIN_DISTANCE
+      and speed >= PERSON_MIN_SPEED
+      and closing >= PERSON_MIN_CLOSING
+
+    rows[#rows + 1] = {
+      kind = "person",
+      key = key,
+      name = v.username or "UNKNOWN",
+      x = lx, y = ly, z = lz, d = d,
+      closing = closing,
+      speed = speed,
+      eta = closing > 1 and d / closing or nil,
+      warning = warning,
+      state = warning and "FAST IN" or "PERSON",
+      rank = warning and 1 or 0,
+    }
   end
 
-  if phase < 18 then
-    return {{
-      key = "TEST-WATCH", name = "AIRCRAFT", x = 1700, y = 30, z = 1450,
-      d = 2235, closing = 0, speed = 0, eta = nil,
-      sector = true, rank = 1, state = "WATCH",
-    }}
-  end
+  cleanup(personTracks, now)
+  table.sort(rows, function(a, b)
+    if a.warning ~= b.warning then return a.warning end
+    return a.d < b.d
+  end)
+  return rows
+end
 
-  local rank, state, d, closing
-  if phase < 28 then
-    rank, state = 2, "INBOUND"
-    d = 1900 - (phase - 18) * 70
-    closing = 70
-  elseif phase < 36 then
-    rank, state = 3, "HIGH"
-    d = 1150 - (phase - 28) * 85
-    closing = 85
-  else
-    rank, state = 4, "CRIT"
-    d = math.max(180, 470 - (phase - 36) * 70)
-    closing = 70
-  end
-
+local function testData(now)
+  local phase = now % 52
+  local subs, people = {}, {}
   local dx = SECTOR_X / SECTOR_LEN
   local dz = SECTOR_Z / SECTOR_LEN
-  return {{
-    key = "TEST-THREAT", name = "AIRCRAFT",
-    x = dx * d, y = 25, z = dz * d,
-    d = d, closing = closing, speed = closing + 3,
-    eta = d / closing, sector = true, rank = rank, state = state,
-  }}
-end
 
-local function overall(rows)
-  if #rows == 0 then
-    return "CLEAR", "NO CONTACTS DETECTED", C.green, C.clearBg, false
-  end
-
-  local top = rows[1]
-  if top.rank == 0 then
-    local n = #rows
-    return "CONTACT", tostring(n) .. (n == 1 and " CONTACT DETECTED" or " CONTACTS DETECTED"), C.cyan, C.panel2, false
-  elseif top.rank == 1 then
-    return "WATCH", "CONTACT IN WATCH SECTOR", C.yellow, C.watchBg, false
-  elseif top.rank == 2 then
-    return "INBOUND", "APPROACHING CONTACT", C.orange, C.alertBg, true
-  elseif top.rank == 3 then
-    return "HIGH", "THREAT - SIREN ACTIVE", C.red, C.alertBg, true
+  if phase < 6 or phase >= 48 then
+    return subs, people
+  elseif phase < 12 then
+    people[1] = {
+      kind = "person", name = "TESTER", x = -360, y = 0, z = -260,
+      d = 444, speed = 2, closing = 1, eta = nil, warning = false, rank = 0, state = "PERSON",
+    }
+  elseif phase < 20 then
+    local d = 850 - (phase - 12) * 45
+    people[1] = {
+      kind = "person", name = "RUNNER", x = dx * d, y = 0, z = dz * d,
+      d = d, speed = 48, closing = 45, eta = d / 45, warning = true, rank = 1, state = "FAST IN",
+    }
+  elseif phase < 28 then
+    local d = 1700 - (phase - 20) * 70
+    subs[1] = {
+      kind = "sub", name = "AIRCRAFT", x = dx * d, y = 20, z = dz * d,
+      d = d, speed = 73, closing = 70, eta = d / 70,
+      sector = true, rank = 2, state = "INBOUND",
+    }
+  elseif phase < 40 then
+    local d1 = 1150 - (phase - 28) * 55
+    local d2 = 780 - (phase - 28) * 35
+    subs[1] = {
+      kind = "sub", name = "AIRCRAFT", x = dx * d1, y = 20, z = dz * d1,
+      d = d1, speed = 58, closing = 55, eta = d1 / 55,
+      sector = true, rank = d1 < 600 and 4 or 2, state = d1 < 600 and "CRIT" or "INBOUND",
+    }
+    people[1] = {
+      kind = "person", name = "RIDER", x = dx * d2, y = 0, z = dz * d2,
+      d = d2, speed = 38, closing = 35, eta = d2 / 35,
+      warning = true, rank = 1, state = "FAST IN",
+    }
   else
-    return "CRITICAL", "IMMEDIATE THREAT", C.magenta, C.alertBg, true
+    local d = math.max(180, 460 - (phase - 40) * 60)
+    subs[1] = {
+      kind = "sub", name = "AIRCRAFT", x = dx * d, y = 20, z = dz * d,
+      d = d, speed = 63, closing = 60, eta = d / 60,
+      sector = true, rank = 4, state = "CRIT",
+    }
+  end
+
+  return subs, people
+end
+
+local function summarize(subs, people)
+  local topSub = subs[1]
+  local topPerson = people[1]
+  local personWarning = topPerson and topPerson.warning or false
+  local subInbound = topSub and topSub.rank >= 2 or false
+  local subSevere = topSub and topSub.rank >= 3 or false
+  local combined = personWarning and subInbound
+  local siren = combined or subSevere
+
+  if topSub and topSub.rank >= 4 then
+    return "CRITICAL", "IMMEDIATE CONTRAPTION THREAT", C.magenta, C.critical, siren, combined
+  elseif combined then
+    return "ALARM", "PERSON + CONTRAPTION APPROACH", C.red, C.alertBg, siren, true
+  elseif topSub and topSub.rank >= 3 then
+    return "HIGH", "CONTRAPTION THREAT", C.red, C.alertBg, siren, false
+  elseif personWarning then
+    return "WARNING", "FAST PERSON APPROACHING", C.orange, C.watchBg, false, false
+  elseif subInbound then
+    return "INBOUND", "CONTRAPTION APPROACHING", C.orange, C.watchBg, false, false
+  elseif topSub and topSub.rank == 1 then
+    return "WATCH", "CONTRAPTION IN WATCH SECTOR", C.yellow, C.watchBg, false, false
+  elseif #subs > 0 or #people > 0 then
+    return "CONTACT", tostring(#people) .. " PERSON / " .. tostring(#subs) .. " CONTRAP", C.cyan, C.infoBg, false, false
+  else
+    return "CLEAR", "NO DETECTIONS", C.green, C.clearBg, false, false
   end
 end
 
-local function drawCoverage(x, y, w, h, rows, top)
+local function drawPersonMarker(px, py, color, warning)
+  line(px - 3, py, px + 3, py, color)
+  line(px, py - 3, px, py + 3, color)
+  rect(px - 1, py - 1, 3, 3, color)
+  if warning then outline(px - 5, py - 5, 10, 10, color) end
+end
+
+local function drawCoverage(x, y, w, h, subs, people)
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
-  txt(x + 5, y + 4, "STATIC COVERAGE", C.dim, 1)
+  txt(x + 5, y + 4, "COVERAGE", C.dim, 1)
 
   local mapX = x + 5
   local mapY = y + 15
@@ -363,7 +450,14 @@ local function drawCoverage(x, y, w, h, rows, top)
     line(mapX + 1, gy, mapX + mapW - 2, gy, C.grid)
   end
 
-  -- Static monitored-sector boundaries, not a rotating sweep.
+  -- Inner box is the smaller personnel sensor range.
+  local personFrac = PERSON_RANGE / CONTRAPTION_RANGE
+  local pw = math.floor(mapW * personFrac)
+  local ph = math.floor(mapH * personFrac)
+  outline(cx - math.floor(pw / 2), cy - math.floor(ph / 2), pw, ph, C.blue)
+  txt(cx - math.floor(pw / 2) + 3, cy - math.floor(ph / 2) + 3, "P1024", C.blue, 1)
+
+  -- Static monitored-sector boundaries.
   local ang = math.atan(SECTOR_Z, SECTOR_X)
   local spread = math.acos(SECTOR_COS)
   local radius = math.min(mapW, mapH) / 2 - 3
@@ -371,112 +465,121 @@ local function drawCoverage(x, y, w, h, rows, top)
   line(cx, cy, cx + math.cos(ang + spread) * radius, cy + math.sin(ang + spread) * radius, C.yellow)
 
   rect(cx - 2, cy - 2, 4, 4, C.green)
-  txt(cx - 11, cy + 5, "BASE", C.green, 1)
 
-  for _, c in ipairs(rows) do
-    local px = cx + clamp(c.x / RANGE, -1, 1) * (mapW / 2 - 5)
-    local py = cy + clamp(c.z / RANGE, -1, 1) * (mapH / 2 - 5)
+  for _, c in ipairs(subs) do
+    local px = cx + clamp(c.x / CONTRAPTION_RANGE, -1, 1) * (mapW / 2 - 5)
+    local py = cy + clamp(c.z / CONTRAPTION_RANGE, -1, 1) * (mapH / 2 - 5)
     local color = C.cyan
     if c.rank == 1 then color = C.yellow end
     if c.rank == 2 then color = C.orange end
     if c.rank == 3 then color = C.red end
     if c.rank >= 4 then color = C.magenta end
-    local s = c == top and 6 or 4
-    rect(px - math.floor(s / 2), py - math.floor(s / 2), s, s, color)
-    if c == top then outline(px - 4, py - 4, 8, 8, color) end
+    rect(px - 2, py - 2, 5, 5, color)
   end
 
-  txt(x + 5, y + h - 10, "RANGE +/-2048", C.dim, 1)
+  for i, p in ipairs(people) do
+    local px = cx + clamp(p.x / CONTRAPTION_RANGE, -1, 1) * (mapW / 2 - 5)
+    local py = cy + clamp(p.z / CONTRAPTION_RANGE, -1, 1) * (mapH / 2 - 5)
+    local color = p.warning and C.orange or C.blue
+    drawPersonMarker(px, py, color, p.warning)
+    if i <= 4 then txt(px + 4, py - 3, short(p.name, 5), color, 1) end
+  end
+
+  txt(x + 5, y + h - 10, "SQUARE  +/-2048", C.dim, 1)
 end
 
-local function drawRightPanel(x, y, w, h, rows, top)
+local function drawSide(x, y, w, h, subs, people)
   rect(x, y, w, h, C.panel)
   outline(x, y, w, h, C.border)
 
-  txt(x + 5, y + 4, "DETECTION", C.dim, 1)
-  txt(x + 5, y + 15, tostring(#rows), #rows > 0 and C.cyan or C.green, 2)
-  txt(x + 5, y + 31, #rows == 1 and "CONTACT" or "CONTACTS", C.text, 1)
+  txt(x + 5, y + 4, "DETECTIONS", C.dim, 1)
+  txt(x + 5, y + 15, "P " .. tostring(#people), #people > 0 and C.blue or C.dim, 1)
+  txt(x + 35, y + 15, "C " .. tostring(#subs), #subs > 0 and C.cyan or C.dim, 1)
 
-  line(x + 4, y + 43, x + w - 5, y + 43, C.border)
-  txt(x + 5, y + 48, "PRIMARY", C.dim, 1)
-
-  if not top then
-    txt(x + 5, y + 61, "NONE", C.green, 1)
-    txt(x + 5, y + 73, "NO AIRCRAFT", C.dim, 1)
+  line(x + 4, y + 27, x + w - 5, y + 27, C.border)
+  txt(x + 5, y + 32, "PERSON", C.dim, 1)
+  local p = people[1]
+  if p then
+    txt(x + 5, y + 43, short(p.name, 9), p.warning and C.orange or C.blue, 1)
+    txt(x + 5, y + 54, p.warning and "FAST IN" or "TRACKED", p.warning and C.orange or C.text, 1)
+    txt(x + 5, y + 65, string.format("V%.0f C%+.0f", p.speed, p.closing), p.warning and C.orange or C.dim, 1)
   else
-    local color = C.cyan
-    if top.rank == 1 then color = C.yellow end
-    if top.rank == 2 then color = C.orange end
-    if top.rank == 3 then color = C.red end
-    if top.rank >= 4 then color = C.magenta end
+    txt(x + 5, y + 45, "NONE", C.green, 1)
+  end
 
-    txt(x + 5, y + 60, short(top.name, 9), color, 1)
-    txt(x + 5, y + 72, top.state, color, 1)
-    txt(x + 5, y + 84, string.format("D %.0f", top.d), C.text, 1)
-    txt(x + 5, y + 96, string.format("CL %+.0f/s", top.closing), top.closing > 1 and C.orange or C.dim, 1)
-    txt(x + 5, y + 108, top.eta and string.format("ETA %.0fs", top.eta) or "ETA --", C.text, 1)
+  line(x + 4, y + 77, x + w - 5, y + 77, C.border)
+  txt(x + 5, y + 82, "CONTRAP", C.dim, 1)
+  local c = subs[1]
+  if c then
+    local color = C.cyan
+    if c.rank == 1 then color = C.yellow end
+    if c.rank == 2 then color = C.orange end
+    if c.rank == 3 then color = C.red end
+    if c.rank >= 4 then color = C.magenta end
+    txt(x + 5, y + 93, c.state, color, 1)
+    txt(x + 5, y + 104, string.format("D%.0f C%+.0f", c.d, c.closing), C.text, 1)
+  else
+    txt(x + 5, y + 95, "NONE", C.green, 1)
   end
 end
 
-local function drawFooter(x, y, w, h, sirenOn)
+local function drawHeader(status, message, color, bg)
+  local x, y, w, h = 6, 6, W - 12, 34
+  rect(x, y, w, h, bg)
+  outline(x, y, w, h, color)
+  hazardRail(x + 4, y + 4, 24, 4)
+  hazardRail(x + w - 28, y + 4, 24, 4)
+  txtCentered(y + 4, status, color, 2, x, w)
+  txtCentered(y + 22, message, C.text, 1, x, w)
+end
+
+local function drawFooter(sirenOn)
+  local x, y, w, h = 6, H - 26, W - 12, 20
   rect(x, y, w, h, C.panel2)
   outline(x, y, w, h, C.border)
-
-  local left = sirenOn and "SIREN ACTIVE" or "SIREN STANDBY"
-  txt(x + 6, y + 5, left, sirenOn and C.red or C.green, 1)
-  txt(x + 6, y + 16, TEST_MODE and (QUIET_TEST and "TEST MODE / QUIET" or "TEST MODE") or "LIVE SENSOR DATA", TEST_MODE and C.yellow or C.cyan, 1)
-
-  txt(x + w - 72, y + 5, textutils.formatTime(os.time(), true), C.text, 1)
-  txt(x + w - 72, y + 16, "GPU " .. short(gpuSide, 5), C.dim, 1)
+  txt(x + 5, y + 4, TEST_MODE and (QUIET_TEST and "TEST QUIET" or "TEST") or "LIVE", TEST_MODE and C.yellow or C.green, 1)
+  txt(x + 55, y + 4, sirenOn and "SIREN ON" or "SIREN OFF", sirenOn and C.red or C.dim, 1)
+  txt(x + 119, y + 4, (subSensor and "C+" or "C-") .. " " .. (personSensor and "P+" or "P-"), C.dim, 1)
+  txt(x + 5, y + 13, "+ PERSON   # CONTRAP", C.dim, 1)
+  txt(x + w - 49, y + 13, textutils.formatTime(os.time(), true), C.text, 1)
 end
 
-local function draw(rows, physicalSiren)
-  local status, message, statusColor, statusBg = overall(rows)
-  local top = rows[1]
+local function draw(subs, people, sirenOn)
+  local status, message, color, bg, autoSiren, combined = summarize(subs, people)
+  sirenOn = sirenOn and autoSiren
 
   gpu.fill(C.bg)
+  drawHeader(status, message, color, bg)
 
-  -- Deliberately dominant status block: one glance shows whether anything is detected.
-  local margin = 4
-  local headerY, headerH = 4, 34
-  rect(margin, headerY, W - margin * 2, headerH, statusBg)
-  outline(margin, headerY, W - margin * 2, headerH, statusColor)
-  hazardRail(margin + 2, headerY + 2, W - margin * 2 - 4, 4)
-  txtCentered(headerY + 8, status, statusColor, 2, margin, W - margin * 2)
-  txtCentered(headerY + 25, message, C.text, 1, margin, W - margin * 2)
-
-  local mainY = 42
-  local footerH = 29
-  local footerY = H - footerH - 4
-  local mainH = footerY - mainY - 4
-  local rightW = 64
-  local gap = 4
-  local leftW = W - margin * 2 - rightW - gap
-
-  drawCoverage(margin, mainY, leftW, mainH, rows, top)
-  drawRightPanel(margin + leftW + gap, mainY, rightW, mainH, rows, top)
-  drawFooter(margin, footerY, W - margin * 2, footerH, physicalSiren)
-
+  local bodyY = 46
+  local footerY = H - 32
+  local bodyH = footerY - bodyY
+  local sideW = 66
+  local gap = 6
+  local mapW = W - 12 - sideW - gap
+  drawCoverage(6, bodyY, mapW, bodyH, subs, people)
+  drawSide(6 + mapW + gap, bodyY, sideW, bodyH, subs, people)
+  drawFooter(sirenOn)
   gpu.sync()
 end
-
-local lastRows = {}
-local lastScan = -100
 
 local function main()
   rs.setOutput(SIREN_SIDE, false)
   while true do
     local now = nowSeconds()
-    if now - lastScan >= SCAN_INTERVAL then
-      lastRows = TEST_MODE and scanTest(now) or scanReal(now)
-      lastScan = now
+    local subs, people
+    if TEST_MODE then
+      subs, people = testData(now)
+    else
+      subs = scanSubs(now)
+      people = scanPeople(now)
     end
 
-    local status, message, statusColor, statusBg, shouldAlarm = overall(lastRows)
-    local physicalSiren = shouldAlarm and not (TEST_MODE and QUIET_TEST)
+    local _, _, _, _, shouldSiren = summarize(subs, people)
+    local physicalSiren = shouldSiren and not (TEST_MODE and QUIET_TEST)
     rs.setOutput(SIREN_SIDE, physicalSiren)
-    draw(lastRows, physicalSiren)
-    sleep(0.15)
+    draw(subs, people, physicalSiren)
+    sleep(SCAN_INTERVAL)
   end
 end
 
