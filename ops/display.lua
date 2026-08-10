@@ -79,6 +79,12 @@ local function ensurePatched(url, path, patches)
   writeFile(path, body)
 end
 
+local function writeFreshPatched(url, path, patches)
+  local body = download(url)
+  body = assert(applyPatches(body, patches), "runtime patch anchor missing: " .. path)
+  writeFile(path, body)
+end
+
 local newOrigin = string.format("local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = %d, %d, %d", ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
 local newDistance = string.format("local dx,dy,dz = %d-x,%d-y,%d-z", ORIGIN_X, ORIGIN_Y, ORIGIN_Z)
 local newSector = string.format("local SECTOR_X, SECTOR_Z = %d, %d", SECTOR_X, SECTOR_Z)
@@ -93,17 +99,27 @@ ensurePatched(BASE_URL, BASE_CACHE, {
   {"local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442", newOrigin},
 })
 
--- NeoPeripheral survival radar intentionally adds error proportional to range:
--- err = distance / pi^3. Raw regression over that jitter can make a stationary
--- contact look like it is closing. Keep a longer window and accept closing
--- speed only when its regression slope is statistically well above the known
--- sensor noise floor.
+-- Survival radar has large randomized spread. The old filter used the expected
+-- noise only, which is not enough when the actual Sable pose itself jitters.
+-- This version measures the observed residual spread, requires a statistically
+-- significant trend, requires the first/last windows to agree, then requires
+-- several consecutive scans before exposing a non-zero closing speed.
 local filterAnchor = "local function totalSpeed(h)"
 local filterCode = [[
 local RADAR_NOISE_FRACTION = 1 / (math.pi * math.pi * math.pi)
-local SUB_NOISE_MIN_SAMPLES = 8
-local SUB_NOISE_MIN_WINDOW = 4.5
+local SUB_NOISE_MIN_SAMPLES = 12
+local SUB_NOISE_MIN_WINDOW = 7.5
 local SUB_NOISE_MIN_Z = 4.5
+local SUB_CONFIRM_SCANS = 3
+
+local function meanRange(h, a, b, field)
+  local sum, n = 0, 0
+  for i=a,b do
+    local v = h[i] and h[i][field]
+    if type(v) == "number" then sum = sum + v; n = n + 1 end
+  end
+  return n > 0 and (sum / n) or 0
+end
 
 local function filteredSubClosing(h)
   local n = #h
@@ -112,55 +128,129 @@ local function filteredSubClosing(h)
   local window = h[n].t - h[1].t
   if window < SUB_NOISE_MIN_WINDOW then return 0 end
 
-  local raw = closingRate(h)
-  if raw <= 0 then return 0 end
-
-  local t0 = h[1].t
-  local st, stt, sd = 0, 0, 0
+  local mt, md = 0, 0
   for _, p in ipairs(h) do
-    local t = p.t - t0
-    st = st + t
-    stt = stt + t * t
-    sd = sd + math.abs(p.d or 0)
+    mt = mt + p.t
+    md = md + math.abs(p.d or 0)
   end
+  mt, md = mt / n, md / n
 
-  local sxx = stt - (st * st) / n
+  local sxx, sxy = 0, 0
+  for _, p in ipairs(h) do
+    local dt = p.t - mt
+    sxx = sxx + dt * dt
+    sxy = sxy + dt * ((p.d or 0) - md)
+  end
   if sxx <= 0.0001 then return 0 end
 
-  local meanD = sd / n
-  -- One radar distance sample has uniform error in +/- distance/pi^3.
-  -- sigma for uniform(-a,a) is a/sqrt(3).
-  local sigma = math.max(1, meanD * RADAR_NOISE_FRACTION / math.sqrt(3))
+  local slope = sxy / sxx
+  local closing = -slope
+  if closing <= 0 then return 0 end
+
+  local intercept = md - slope * mt
+  local sse = 0
+  for _, p in ipairs(h) do
+    local predicted = intercept + slope * p.t
+    local residual = (p.d or 0) - predicted
+    sse = sse + residual * residual
+  end
+
+  local observedSigma = math.sqrt(math.max(0, sse / math.max(1, n - 2)))
+  local theoreticalSigma = math.max(1, md * RADAR_NOISE_FRACTION / math.sqrt(3))
+  local sigma = math.max(1, observedSigma, theoreticalSigma)
   local slopeSigma = sigma / math.sqrt(sxx)
   if slopeSigma <= 0 then return 0 end
+  if closing / slopeSigma < SUB_NOISE_MIN_Z then return 0 end
 
-  local z = raw / slopeSigma
-  if z < SUB_NOISE_MIN_Z then return 0 end
+  -- Independent sanity check: the average of the oldest third must be clearly
+  -- farther away than the newest third. This kills lucky regression slopes.
+  local k = math.max(3, math.floor(n / 3))
+  local oldMean = meanRange(h, 1, k, "d")
+  local newMean = meanRange(h, n-k+1, n, "d")
+  local delta = oldMean - newMean
+  local deltaSigma = sigma * math.sqrt(2 / k)
+  if delta <= math.max(12, 3.5 * deltaSigma) then return 0 end
 
-  return raw
+  return closing
+end
+
+local function smoothSubSample(h)
+  local n = #h
+  if n == 0 then return {x=0,y=0,z=0,d=0} end
+  local first = math.max(1, n - 4)
+  local count = n - first + 1
+  local x,y,z,d = 0,0,0,0
+  for i=first,n do
+    local p=h[i]
+    x=x+(p.x or 0); y=y+(p.y or 0); z=z+(p.z or 0); d=d+(p.d or 0)
+  end
+  return {x=x/count,y=y/count,z=z/count,d=d/count}
+end
+
+local function smoothSubHistory(h)
+  local out = {}
+  for i=1,#h do
+    local a,b=math.max(1,i-2),math.min(#h,i+2)
+    local x,y,z,d=0,0,0,0
+    local count=b-a+1
+    for j=a,b do
+      local p=h[j]
+      x=x+(p.x or 0); y=y+(p.y or 0); z=z+(p.z or 0); d=d+(p.d or 0)
+    end
+    out[#out+1]={t=h[i].t,x=x/count,y=y/count,z=z/count,d=d/count}
+  end
+  return out
 end
 
 local function totalSpeed(h)]]
 
-local oldSubClosing = [[local tr = ensureTrack(subTracks, key)
+local oldSubBlock = [[local tr = ensureTrack(subTracks, key)
     addSample(tr, sample, now)
     local closing = closingRate(tr.history)
-    local row = {]]
+    local row = {
+      kind = "sub",
+      key = key,
+      name = v.name or "АППАРАТ",
+      x = sample.x, y = sample.y, z = sample.z, d = sample.d,
+      closing = closing,
+      speed = totalSpeed(tr.history),
+      eta = closing > 1 and sample.d / closing or nil,
+      sector = inSector(sample.x, sample.z),
+      history = tr.history,
+    }]]
 
-local newSubClosing = [[local tr = ensureTrack(subTracks, key)
+local newSubBlock = [[local tr = ensureTrack(subTracks, key)
     addSample(tr, sample, now)
-    local closing = filteredSubClosing(tr.history)
-    local row = {]]
+    local stable = smoothSubSample(tr.history)
+    local candidateClosing = filteredSubClosing(tr.history)
+    local threshold = stable.d > 1500 and 10 or stable.d > 900 and 6 or 3
+    if candidateClosing > threshold then
+      tr.inboundConfirm = math.min(SUB_CONFIRM_SCANS, (tr.inboundConfirm or 0) + 1)
+    else
+      tr.inboundConfirm = math.max(0, (tr.inboundConfirm or 0) - 1)
+    end
+    local closing = tr.inboundConfirm >= SUB_CONFIRM_SCANS and candidateClosing or 0
+    local row = {
+      kind = "sub",
+      key = key,
+      name = v.name or "АППАРАТ",
+      x = stable.x, y = stable.y, z = stable.z, d = stable.d,
+      closing = closing,
+      speed = closing > 0 and totalSpeed(smoothSubHistory(tr.history)) or 0,
+      eta = closing > 1 and stable.d / closing or nil,
+      sector = inSector(stable.x, stable.z),
+      history = smoothSubHistory(tr.history),
+    }]]
 
--- Main tracker: player local coordinates + monitored direction + robust
--- contraption closing detection.
-ensurePatched(CORE_URL, CORE_CACHE, {
+-- Main tracker is regenerated from the pinned clean core every start. This also
+-- avoids repeatedly injecting the same patch into an already-patched cache.
+writeFreshPatched(CORE_URL, CORE_CACHE, {
   {"local ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 1903, 97, 2442", newOrigin},
   {"local SECTOR_X, SECTOR_Z = 1881, 1632", newSector},
   {"local HISTORY = 10", "local HISTORY = 16"},
-  {"local SUB_MIN_SAMPLES = 4", "local SUB_MIN_SAMPLES = 8"},
+  {"local SUB_MIN_SAMPLES = 4", "local SUB_MIN_SAMPLES = 12"},
   {filterAnchor, filterCode},
-  {oldSubClosing, newSubClosing},
+  {oldSubBlock, newSubBlock},
 })
 
 local guard, err = loadfile(GUARD_CACHE)
