@@ -8,12 +8,24 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 assert(gpu, "compatible display controller not found")
 
-gpu.refreshSize()
-gpu.setSize(64)
-
-local W, H = gpu.getSize()
-assert(type(W) == "number" and type(H) == "number", "could not determine display size")
 print("display controller: " .. tostring(gpuSide))
+
+-- refreshSize() is asynchronous in Tom's Peripherals. Do not call setSize()
+-- until the GPU has actually discovered at least one attached monitor.
+local W, H = 0, 0
+for i = 1, 20 do
+  gpu.refreshSize()
+  sleep(0.1)
+  W, H = gpu.getSize()
+  if type(W) == "number" and type(H) == "number" and W > 0 and H > 0 then break end
+end
+
+assert(type(W) == "number" and type(H) == "number" and W > 0 and H > 0,
+  "no bitmap display detected by GPU")
+
+gpu.setSize(64)
+sleep(0.1)
+W, H = gpu.getSize()
 print("display size: " .. tostring(W) .. "x" .. tostring(H))
 
 local C = {
