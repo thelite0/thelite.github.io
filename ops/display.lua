@@ -1,12 +1,19 @@
-local gpu = peripheral.wrap("bottom")
-assert(gpu, "display controller not found on bottom")
-assert(gpu.refreshSize and gpu.sync, "bottom peripheral is not a compatible display controller")
+local gpu, gpuSide
+for _, name in ipairs(peripheral.getNames()) do
+  local p = peripheral.wrap(name)
+  if p and type(p.refreshSize) == "function" and type(p.sync) == "function" and type(p.getSize) == "function" then
+    gpu, gpuSide = p, name
+    break
+  end
+end
+assert(gpu, "compatible display controller not found")
 
 gpu.refreshSize()
 gpu.setSize(64)
 
 local W, H = gpu.getSize()
 assert(type(W) == "number" and type(H) == "number", "could not determine display size")
+print("display controller: " .. tostring(gpuSide))
 print("display size: " .. tostring(W) .. "x" .. tostring(H))
 
 local C = {
@@ -23,9 +30,6 @@ local C = {
   red    = 0xFFFF5D68,
 }
 
--- Tom's GPU rejects primitives which touch or cross its buffer boundary.
--- Keep every primitive inside a small inset so this works regardless of
--- monitor shape/resolution details.
 local MIN_X, MIN_Y = 2, 2
 local MAX_X, MAX_Y = math.max(2, W - 2), math.max(2, H - 2)
 
@@ -38,18 +42,13 @@ end
 local function rect(x, y, w, h, c)
   x, y, w, h = math.floor(x), math.floor(y), math.floor(w), math.floor(h)
   if w < 1 or h < 1 then return end
-
   x = clamp(x, MIN_X, MAX_X)
   y = clamp(y, MIN_Y, MAX_Y)
-
   local maxW = MAX_X - x
   local maxH = MAX_Y - y
   w = math.min(w, maxW)
   h = math.min(h, maxH)
-
-  if w >= 1 and h >= 1 then
-    gpu.filledRectangle(x, y, w, h, c)
-  end
+  if w >= 1 and h >= 1 then gpu.filledRectangle(x, y, w, h, c) end
 end
 
 local function outline(x, y, w, h, c)
@@ -99,7 +98,6 @@ local sweep = 0
 while true do
   gpu.fill(C.bg)
 
-  -- Everything is intentionally inset from the physical buffer edges.
   rect(3, 3, W - 7, 11, C.panel2)
   rect(3, 13, W - 7, 1, C.cyan)
   txt(6, 5, "NODE", C.text, 1)
