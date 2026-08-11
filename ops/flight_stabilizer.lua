@@ -1,4 +1,4 @@
--- Crystalite UAV robust attitude + heading stabilizer
+-- Crystalite UAV damped attitude + heading stabilizer
 -- CC:Sable + Create Propulsion Tilt Adapters
 --
 -- tilt_adapter_1 = front LEFT
@@ -7,69 +7,103 @@
 -- Raw adapter signs are mirrored: left=-logical, right=+logical.
 --
 -- Flight test established:
---   NEGATIVE collective (manual S direction) counters nose-up/backflip.
+--   positive collective -> nose-up authority
+--   negative collective (manual S direction) -> nose-down / anti-backflip authority
 --
--- Control philosophy:
---   * no binary dive/normal mode switching
---   * pitch correction is continuous and fades smoothly near level
---   * roll LEVELING always wins over heading hold when the aircraft is badly tilted
---   * heading hold only asks for a modest bank while attitude is already safe
---   * body forward axis is discovered once, but WORLD forward is recomputed every tick
+-- v5 control philosophy:
+--   * low gains near level, stronger proportional authority only when error is large
+--   * much more rate damping to kill the repeating wobble
+--   * adaptive actuator slew: gentle near level, fast only during real recovery
+--   * heading hold fades out when pitch/roll/yaw rates are high
+--   * heading bank target itself is slew-limited
+--   * slow auto-trim learns the constant wing incidence needed for level flight
+--   * auto-trim only learns during genuinely calm, upright flight
+--   * body forward axis is discovered once; WORLD forward updates every tick
 
 local LEFT_NAME  = "tilt_adapter_1"
 local RIGHT_NAME = "tilt_adapter_2"
 
--- Pitch: logical collective wing incidence per attitude/rate error.
-local PITCH_KP = 0.82
-local PITCH_KD = 0.30
+-- Gain scheduling: deliberately soft around level, stronger farther away.
+local PITCH_KP_NEAR = 0.24
+local PITCH_KP_FAR  = 0.58
+local PITCH_KD      = 0.34
+local PITCH_GAIN_BLEND_START = 4.0
+local PITCH_GAIN_BLEND_FULL  = 20.0
 
--- Roll: differential wing incidence. Keep this at +1 unless a pure roll test
--- proves the differential actuator itself is reversed.
-local ROLL_KP = 0.72
-local ROLL_KD = 0.22
+local ROLL_KP_NEAR = 0.28
+local ROLL_KP_FAR  = 0.52
+local ROLL_KD      = 0.30
+local ROLL_GAIN_BLEND_START = 4.0
+local ROLL_GAIN_BLEND_FULL  = 18.0
+
+-- Keep at +1 unless a pure roll test proves the physical differential actuator is reversed.
 local ROLL_ACTUATOR_SIGN = 1
 
--- Heading is recovered by banking, NOT by pretending differential lift is a rudder.
--- IMPORTANT: the previous script had this sign backwards.
+-- Heading is recovered by requesting a bank. Previous heading->bank sign was inverted;
+-- -1 is the corrected sign from the latest revision.
 local HEADING_BANK_SIGN = -1
-local HEADING_TO_BANK = 0.30
-local MAX_HEADING_BANK = 12.0
-local HEADING_DEADBAND = 2.0
+local HEADING_TO_BANK = 0.18
+local MAX_HEADING_BANK = 8.0
+local HEADING_DEADBAND = 3.0
+local BANK_TARGET_SLEW_DPS = 10.0
+local BANK_TARGET_RETURN_DPS = 24.0
 
 -- Wing command limits.
-local MIN_COLLECTIVE = -20.0 -- confirmed anti-backflip direction
+local MIN_COLLECTIVE = -20.0
 local MAX_COLLECTIVE =  14.0
 local MAX_DIFFERENTIAL = 12.0
 local MAX_RAW_ADAPTER = 30.0
-local TRIM = 0.0
+local BASE_TRIM = 0.0
 
--- Smooth emergency assistance. These do NOT create discrete modes.
-local BACKFLIP_PITCH_START = 6.0
-local BACKFLIP_PITCH_FULL  = 28.0
-local BACKFLIP_RATE_START  = 10.0
-local BACKFLIP_RATE_FULL   = 45.0
+-- Auto-trim. This is intentionally SLOW: it learns the aircraft's steady bias,
+-- not transient maneuvers. Negative pitch error naturally learns positive incidence.
+local AUTOTRIM_KI = 0.030
+local MAX_AUTOTRIM = 4.0
+local TRIM_SETTLE_TIME = 1.5
+local TRIM_PITCH_WINDOW = 7.0
+local TRIM_ROLL_WINDOW = 7.0
+local TRIM_PITCH_RATE_WINDOW = 7.0
+local TRIM_ROLL_RATE_WINDOW = 8.0
+local TRIM_HEADING_ERROR_WINDOW = 8.0
+local MIN_TRIM_SPEED = 0.70
+
+-- Smooth emergency assistance. Still continuous -- no hard recovery mode switch.
+local BACKFLIP_PITCH_START = 8.0
+local BACKFLIP_PITCH_FULL  = 30.0
+local BACKFLIP_RATE_START  = 14.0
+local BACKFLIP_RATE_FULL   = 50.0
 local BACKFLIP_MAX_COMMAND = -20.0
 
-local DIVE_PITCH_START = 8.0
-local DIVE_PITCH_FULL  = 35.0
-local DIVE_RATE_START  = 12.0
-local DIVE_RATE_FULL   = 50.0
+local DIVE_PITCH_START = 10.0
+local DIVE_PITCH_FULL  = 38.0
+local DIVE_RATE_START  = 16.0
+local DIVE_RATE_FULL   = 55.0
 local DIVE_MAX_COMMAND = 14.0
 
--- Heading authority fades away as attitude becomes unsafe.
-local HEADING_PITCH_SAFE = 6.0
-local HEADING_PITCH_OFF  = 20.0
-local HEADING_ROLL_SAFE  = 5.0
-local HEADING_ROLL_OFF   = 16.0
-local MIN_HEADING_SPEED  = 0.55
+-- Heading authority disappears when the airframe is not calm enough to turn safely.
+local HEADING_PITCH_SAFE = 5.0
+local HEADING_PITCH_OFF  = 16.0
+local HEADING_ROLL_SAFE  = 4.0
+local HEADING_ROLL_OFF   = 14.0
+local HEADING_PITCH_RATE_SAFE = 5.0
+local HEADING_PITCH_RATE_OFF  = 16.0
+local HEADING_ROLL_RATE_SAFE  = 5.0
+local HEADING_ROLL_RATE_OFF   = 18.0
+local HEADING_YAW_RATE_SAFE   = 7.0
+local HEADING_YAW_RATE_OFF    = 24.0
+local MIN_HEADING_SPEED = 0.65
 
--- Smooth command slew. Prevents target angle from snapping/cancelling every tick.
-local COLLECTIVE_SLEW_DPS = 80.0
-local DIFFERENTIAL_SLEW_DPS = 65.0
+-- Actuator slew. Near-level values are intentionally slow to prevent self-excited wobble.
+-- A severe pitch/roll error smoothly raises the allowed slew so recovery still has authority.
+local COLLECTIVE_SLEW_CALM_DPS = 28.0
+local COLLECTIVE_SLEW_EMERGENCY_DPS = 90.0
+local DIFFERENTIAL_SLEW_CALM_DPS = 24.0
+local DIFFERENTIAL_SLEW_EMERGENCY_DPS = 70.0
 
 local LOOP_DT = 0.05
 local MIN_DETECT_SPEED = 0.35
 local TELEMETRY_PERIOD = 0.20
+local RATE_ALPHA = 0.22
 
 local left = peripheral.wrap(LEFT_NAME)
 local right = peripheral.wrap(RIGHT_NAME)
@@ -90,6 +124,10 @@ local function smoothstep(edge0, edge1, x)
     if edge1 <= edge0 then return x >= edge1 and 1 or 0 end
     local t = clamp((x - edge0) / (edge1 - edge0), 0, 1)
     return t * t * (3 - 2 * t)
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * clamp(t, 0, 1)
 end
 
 local function slew(current, target, ratePerSec, dt)
@@ -197,11 +235,12 @@ end
 
 local function detectForward()
     term.clear(); term.setCursorPos(1,1)
-    print("UAV stabilizer v4")
+    print("UAV stabilizer v5")
+    print("DAMPED + AUTO-TRIM")
     print("Waiting for forward movement...")
 
     while true do
-        setControls(TRIM,0)
+        setControls(BASE_TRIM,0)
         local q=getOrientation()
         local vLocal=qrotate(qconj(q),getVelocity())
         local h=math.sqrt(vLocal.x*vLocal.x+vLocal.z*vLocal.z)
@@ -240,10 +279,11 @@ local function headingDeg(forwardWorld)
 end
 
 local function attitude(q,forwardLocal)
-    -- dynamic WORLD forward, updated every tick from latest Sable orientation
+    -- WORLD nose direction is recomputed from the latest Sable orientation every tick.
     local forwardWorld=qrotate(q,forwardLocal)
     local upWorld=qrotate(q,vec(0,1,0))
-    local rightWorld=qrotate(q,norm(cross(forwardLocal,vec(0,1,0))))
+    local rightLocal=norm(cross(forwardLocal,vec(0,1,0)))
+    local rightWorld=qrotate(q,rightLocal)
 
     local h=math.sqrt(forwardWorld.x*forwardWorld.x+forwardWorld.z*forwardWorld.z)
     local pitch=math.atan(forwardWorld.y,h)*RAD2DEG
@@ -257,12 +297,11 @@ local function attitude(q,forwardLocal)
     return pitch,roll,upWorld.y,forwardWorld,rightWorld
 end
 
--- Derive angular velocity from consecutive Sable quaternions. This avoids noisy
--- finite-difference pitch/roll angles and keeps the rate sign valid near steep attitudes.
+-- Angular velocity from consecutive Sable orientations, expressed in WORLD space.
 local function angularVelocityWorld(qPrev,qNow,dt)
     local dq=qnorm(qmul(qNow,qconj(qPrev)))
 
-    -- use shortest equivalent quaternion rotation
+    -- shortest equivalent quaternion rotation
     if dq.w < 0 then
         dq={x=-dq.x,y=-dq.y,z=-dq.z,w=-dq.w}
     end
@@ -289,8 +328,11 @@ local function main()
     local filteredRollRate=0
     local filteredYawRate=0
 
-    local collectiveCmd=0
+    local collectiveCmd=BASE_TRIM
     local differentialCmd=0
+    local desiredRollCmd=0
+    local autoTrim=0
+    local trimStableTime=0
     local nextTelemetry=os.clock()
 
     while true do
@@ -301,92 +343,137 @@ local function main()
 
         q=getOrientation()
         local pitch,roll,upY,currentForward,rightWorld=attitude(q,forwardLocal)
-        local speed=len(getVelocity())
+        local velocity=getVelocity()
+        local speed=len(velocity)
         local yawErr=headingError(currentForward,targetForward)
 
         local omega=angularVelocityWorld(qPrev,q,dt)
         qPrev=q
 
-        -- Positive pitch rate = nose rising. Positive roll rate follows roll sign above.
+        -- Positive pitch rate = nose rising.
         local pitchRate=dot(omega,rightWorld)*RAD2DEG
         local rollRate=dot(omega,currentForward)*RAD2DEG
         local yawRate=dot(omega,WORLD_UP)*RAD2DEG
 
-        -- Small low-pass filter: enough damping without the old stop/start behavior.
-        local RATE_ALPHA=0.35
+        -- More smoothing than v4. We care about damping the real motion, not chasing samples.
         filteredPitchRate=filteredPitchRate+(pitchRate-filteredPitchRate)*RATE_ALPHA
         filteredRollRate=filteredRollRate+(rollRate-filteredRollRate)*RATE_ALPHA
         filteredYawRate=filteredYawRate+(yawRate-filteredYawRate)*RATE_ALPHA
 
-        -- ----- PITCH: fully continuous -----
-        local collectiveTarget=TRIM-PITCH_KP*pitch-PITCH_KD*filteredPitchRate
-
-        -- Smooth anti-backflip assistance. As the plane recovers, severity fades to 0.
+        -- ----- CONTINUOUS RECOVERY SEVERITY -----
         local backflipSeverity=math.max(
             smoothstep(BACKFLIP_PITCH_START,BACKFLIP_PITCH_FULL,pitch),
             smoothstep(BACKFLIP_RATE_START,BACKFLIP_RATE_FULL,filteredPitchRate)
         )
-        local backflipAssist=BACKFLIP_MAX_COMMAND*backflipSeverity
-        if backflipAssist < collectiveTarget then collectiveTarget=backflipAssist end
-
-        -- Smooth nosedive assistance.
         local diveSeverity=math.max(
             smoothstep(DIVE_PITCH_START,DIVE_PITCH_FULL,-pitch),
             smoothstep(DIVE_RATE_START,DIVE_RATE_FULL,-filteredPitchRate)
         )
-        local diveAssist=DIVE_MAX_COMMAND*diveSeverity
-        if diveAssist > collectiveTarget then collectiveTarget=diveAssist end
-
-        collectiveTarget=clamp(collectiveTarget,MIN_COLLECTIVE,MAX_COLLECTIVE)
+        local pitchSeverity=math.max(backflipSeverity,diveSeverity)
 
         -- ----- HEADING -> BANK TARGET -----
-        -- Critical fix: previous heading->bank sign was inverted.
         local rawHeadingBank=0
         if math.abs(yawErr)>HEADING_DEADBAND then
             rawHeadingBank=HEADING_BANK_SIGN*HEADING_TO_BANK*yawErr
             rawHeadingBank=clamp(rawHeadingBank,-MAX_HEADING_BANK,MAX_HEADING_BANK)
         end
 
-        -- Gradually remove heading authority if pitch/roll is unsafe.
-        -- If the aircraft is visibly tilted, desiredRoll tends to ZERO, so leveling wins.
+        -- Heading authority now also depends on ANGULAR RATES. If the aircraft is
+        -- wobbling, heading hold gets out of the way and attitude damping wins.
         local pitchSafety=1-smoothstep(HEADING_PITCH_SAFE,HEADING_PITCH_OFF,math.abs(pitch))
         local rollSafety=1-smoothstep(HEADING_ROLL_SAFE,HEADING_ROLL_OFF,math.abs(roll))
+        local pitchRateSafety=1-smoothstep(HEADING_PITCH_RATE_SAFE,HEADING_PITCH_RATE_OFF,math.abs(filteredPitchRate))
+        local rollRateSafety=1-smoothstep(HEADING_ROLL_RATE_SAFE,HEADING_ROLL_RATE_OFF,math.abs(filteredRollRate))
+        local yawRateSafety=1-smoothstep(HEADING_YAW_RATE_SAFE,HEADING_YAW_RATE_OFF,math.abs(filteredYawRate))
         local speedSafety=smoothstep(MIN_HEADING_SPEED,MIN_HEADING_SPEED+0.8,speed)
-        local uprightSafety=smoothstep(0.05,0.55,upY)
-        local headingAuthority=clamp(pitchSafety*rollSafety*speedSafety*uprightSafety,0,1)
+        local uprightSafety=smoothstep(0.15,0.70,upY)
 
-        local desiredRoll=rawHeadingBank*headingAuthority
+        local headingAuthority=clamp(
+            pitchSafety*rollSafety*pitchRateSafety*rollRateSafety*yawRateSafety*speedSafety*uprightSafety,
+            0,1
+        )
 
-        -- ----- ROLL: always active -----
-        local rollError=roll-desiredRoll
-        local differentialTarget=ROLL_ACTUATOR_SIGN*(-ROLL_KP*rollError-ROLL_KD*filteredRollRate)
+        local desiredRollTarget=rawHeadingBank*headingAuthority
+        local bankSlew=(headingAuthority < 0.15) and BANK_TARGET_RETURN_DPS or BANK_TARGET_SLEW_DPS
+        desiredRollCmd=slew(desiredRollCmd,desiredRollTarget,bankSlew,dt)
+
+        -- ----- AUTO-TRIM -----
+        -- Learn only when calm. This prevents wind-up during recoveries/turns.
+        local trimEligible =
+            speed >= MIN_TRIM_SPEED and
+            upY > 0.75 and
+            math.abs(pitch) <= TRIM_PITCH_WINDOW and
+            math.abs(roll) <= TRIM_ROLL_WINDOW and
+            math.abs(filteredPitchRate) <= TRIM_PITCH_RATE_WINDOW and
+            math.abs(filteredRollRate) <= TRIM_ROLL_RATE_WINDOW and
+            math.abs(yawErr) <= TRIM_HEADING_ERROR_WINDOW and
+            math.abs(desiredRollCmd) <= 2.0 and
+            pitchSeverity < 0.05
+
+        if trimEligible then
+            trimStableTime=trimStableTime+dt
+            if trimStableTime >= TRIM_SETTLE_TIME then
+                -- target pitch is 0. Negative pitch (nose down) learns POSITIVE trim.
+                local pitchError=-pitch
+                autoTrim=clamp(autoTrim+AUTOTRIM_KI*pitchError*dt,-MAX_AUTOTRIM,MAX_AUTOTRIM)
+            end
+        else
+            trimStableTime=0
+        end
+
+        -- ----- PITCH: gain-scheduled PD + learned trim -----
+        local pitchBlend=smoothstep(PITCH_GAIN_BLEND_START,PITCH_GAIN_BLEND_FULL,math.abs(pitch))
+        local pitchKp=lerp(PITCH_KP_NEAR,PITCH_KP_FAR,pitchBlend)
+        local collectiveTarget=BASE_TRIM+autoTrim-pitchKp*pitch-PITCH_KD*filteredPitchRate
+
+        -- Emergency assistance is smooth and fades automatically as attitude/rate recover.
+        local backflipAssist=BACKFLIP_MAX_COMMAND*backflipSeverity
+        if backflipAssist < collectiveTarget then collectiveTarget=backflipAssist end
+
+        local diveAssist=DIVE_MAX_COMMAND*diveSeverity
+        if diveAssist > collectiveTarget then collectiveTarget=diveAssist end
+
+        collectiveTarget=clamp(collectiveTarget,MIN_COLLECTIVE,MAX_COLLECTIVE)
+
+        -- ----- ROLL: gain-scheduled PD -----
+        local rollError=roll-desiredRollCmd
+        local rollBlend=smoothstep(ROLL_GAIN_BLEND_START,ROLL_GAIN_BLEND_FULL,math.abs(rollError))
+        local rollKp=lerp(ROLL_KP_NEAR,ROLL_KP_FAR,rollBlend)
+        local differentialTarget=ROLL_ACTUATOR_SIGN*(-rollKp*rollError-ROLL_KD*filteredRollRate)
         differentialTarget=clamp(differentialTarget,-MAX_DIFFERENTIAL,MAX_DIFFERENTIAL)
 
-        -- Smooth actuator targets. No command/cancel/command snapping.
-        collectiveCmd=slew(collectiveCmd,collectiveTarget,COLLECTIVE_SLEW_DPS,dt)
-        differentialCmd=slew(differentialCmd,differentialTarget,DIFFERENTIAL_SLEW_DPS,dt)
+        -- Adaptive slew: calm flight moves the wings slowly; genuine recovery may move fast.
+        local collectiveSlew=lerp(COLLECTIVE_SLEW_CALM_DPS,COLLECTIVE_SLEW_EMERGENCY_DPS,pitchSeverity)
+        local rollSeverity=math.max(
+            smoothstep(5.0,24.0,math.abs(rollError)),
+            smoothstep(7.0,30.0,math.abs(filteredRollRate))
+        )
+        local differentialSlew=lerp(DIFFERENTIAL_SLEW_CALM_DPS,DIFFERENTIAL_SLEW_EMERGENCY_DPS,rollSeverity)
+
+        collectiveCmd=slew(collectiveCmd,collectiveTarget,collectiveSlew,dt)
+        differentialCmd=slew(differentialCmd,differentialTarget,differentialSlew,dt)
 
         local rawLeft,rawRight=setControls(collectiveCmd,differentialCmd)
 
         if os.clock()>=nextTelemetry then
             nextTelemetry=os.clock()+TELEMETRY_PERIOD
 
-            local mode="LEVEL"
-            if backflipSeverity>0.15 or diveSeverity>0.15 then mode="PITCH RECOVERY"
-            elseif math.abs(roll)>HEADING_ROLL_SAFE then mode="ROLL RECOVERY"
-            elseif headingAuthority>0.1 and math.abs(yawErr)>HEADING_DEADBAND then mode="HEADING HOLD" end
+            local mode="TRIM / LEVEL"
+            if pitchSeverity>0.15 then mode="PITCH RECOVERY"
+            elseif math.abs(roll)>HEADING_ROLL_SAFE or math.abs(filteredRollRate)>HEADING_ROLL_RATE_SAFE then mode="ROLL DAMPING"
+            elseif headingAuthority>0.15 and math.abs(yawErr)>HEADING_DEADBAND then mode="HEADING HOLD" end
 
             term.clear(); term.setCursorPos(1,1)
-            print("UAV STABILIZER v4")
+            print("UAV STABILIZER v5")
             print("MODE: "..mode)
             print("Body nose: "..forwardLabel)
             print(string.format("Heading %6.1f err %6.1f",headingDeg(currentForward),yawErr))
-            print(string.format("Heading authority %.2f",headingAuthority))
+            print(string.format("Heading auth %.2f bank %5.1f",headingAuthority,desiredRollCmd))
             print(string.format("Pitch %6.1f rate %7.1f",pitch,filteredPitchRate))
-            print(string.format("Roll  %6.1f target %6.1f",roll,desiredRoll))
-            print(string.format("Roll rate %7.1f",filteredRollRate))
-            print(string.format("Collective %6.1f -> %6.1f",collectiveCmd,collectiveTarget))
-            print(string.format("Diff       %6.1f -> %6.1f",differentialCmd,differentialTarget))
+            print(string.format("Roll  %6.1f rate %7.1f",roll,filteredRollRate))
+            print(string.format("AutoTrim %+5.2f  settle %.1fs",autoTrim,trimStableTime))
+            print(string.format("Collect %6.1f -> %6.1f",collectiveCmd,collectiveTarget))
+            print(string.format("Diff    %6.1f -> %6.1f",differentialCmd,differentialTarget))
             print(string.format("Raw L/R %6.1f / %6.1f",rawLeft,rawRight))
             print("")
             print("Ctrl+T = stop + neutral")
