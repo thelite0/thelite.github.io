@@ -96,10 +96,66 @@ local function qmul(a, b)
 end
 
 local function qrotate(q, v)
-    -- q * (v,0) * conjugate(q)
     local p = { x=v.x, y=v.y, z=v.z, w=0 }
     local r = qmul(qmul(q, p), qconj(q))
     return vec(r.x, r.y, r.z)
+end
+
+-- CC:Sable 1.3.4 in this pack returns orientation as axis-angle:
+--   { a = angleRadians, v = { axisX, axisY, axisZ } }
+-- Newer source revisions may return {x,y,z,w} directly, so support both.
+local function tableXYZ(t)
+    assert(type(t) == "table", "Expected vector table")
+
+    local x = t.x
+    local y = t.y
+    local z = t.z
+
+    if x == nil then x = t[1] end
+    if y == nil then y = t[2] end
+    if z == nil then z = t[3] end
+
+    assert(type(x) == "number" and type(y) == "number" and type(z) == "number",
+        "Unsupported Sable vector format")
+
+    return x, y, z
+end
+
+local function orientationToQuaternion(o)
+    assert(type(o) == "table", "Sable orientation is not a table")
+
+    -- Quaternion format.
+    if type(o.x) == "number" and type(o.y) == "number" and
+       type(o.z) == "number" and type(o.w) == "number" then
+        return qnorm({x=o.x, y=o.y, z=o.z, w=o.w})
+    end
+
+    -- Axis-angle format observed in the installed CC:Sable build.
+    if type(o.a) == "number" and type(o.v) == "table" then
+        local ax, ay, az = tableXYZ(o.v)
+        local axisLen = math.sqrt(ax*ax + ay*ay + az*az)
+
+        -- Identity rotation can legally have an arbitrary/zero axis.
+        if axisLen < 1e-9 then
+            if math.abs(o.a) < 1e-9 then
+                return {x=0, y=0, z=0, w=1}
+            end
+            error("Sable returned non-zero axis-angle rotation with zero axis")
+        end
+
+        ax, ay, az = ax/axisLen, ay/axisLen, az/axisLen
+        local half = o.a * 0.5
+        local s = math.sin(half)
+
+        return qnorm({
+            x = ax * s,
+            y = ay * s,
+            z = az * s,
+            w = math.cos(half)
+        })
+    end
+
+    error("Unsupported CC:Sable orientation format")
 end
 
 local RAD2DEG = 180 / math.pi
@@ -129,12 +185,12 @@ end
 local function getOrientation()
     local pose = sublevel.getLogicalPose()
     assert(pose and pose.orientation, "Sable pose has no orientation")
-    return qnorm(pose.orientation)
+    return orientationToQuaternion(pose.orientation)
 end
 
 local function getVelocity()
     local v = sublevel.getLinearVelocity()
-    assert(v and v.x and v.y and v.z, "Sable returned invalid linear velocity")
+    assert(v and v.x ~= nil and v.y ~= nil and v.z ~= nil, "Sable returned invalid linear velocity")
     return vec(v.x, v.y, v.z)
 end
 
