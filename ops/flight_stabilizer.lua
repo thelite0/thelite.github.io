@@ -15,25 +15,31 @@
 --   heading = launch/activation heading
 --   roll = whatever bank is needed to recover heading, otherwise level
 --
--- The BODY forward axis is discovered once because the physical nose axis cannot
--- change. Its WORLD forward vector is recomputed every control tick, so yaw is
--- tracked continuously rather than being left free.
+-- IMPORTANT CONTROLLER DESIGN:
+--   There are NO fixed-angle pitch recovery commands anymore.
+--   Pitch correction is continuous: the worse the attitude/rate, the stronger
+--   the command; as the aircraft recovers, the command automatically fades.
+--   A hysteresis latch only decides when pitch gets PRIORITY over heading/roll,
+--   so it cannot flicker recovery on/off around one threshold.
 
 local LEFT_NAME  = "tilt_adapter_1"
 local RIGHT_NAME = "tilt_adapter_2"
 
--- Pitch controller.
-local PITCH_KP = 0.95
-local PITCH_KD = 0.28
+-- Base pitch PD gains near level.
+local PITCH_KP_MIN = 0.72
+local PITCH_KD_MIN = 0.18
 
--- Roll controller. Differential wing incidence controls bank, and bank is used
--- to pull the aircraft back onto the commanded heading.
+-- Gains at severe pitch error. Interpolated continuously between MIN and MAX.
+local PITCH_KP_MAX = 1.55
+local PITCH_KD_MAX = 0.42
+local FULL_PITCH_GAIN_AT = 35.0 -- degrees from level
+
+-- Roll controller.
 local ROLL_KP  = 0.55
 local ROLL_KD  = 0.16
 local ROLL_SIGN = 1
 
 -- Heading -> desired bank.
--- Example: 20 deg heading error asks for about 12 deg bank.
 local HEADING_TO_BANK = 0.60
 local MAX_BANK_TARGET = 25.0
 local HEADING_DEADBAND = 1.0
@@ -41,22 +47,26 @@ local HEADING_DEADBAND = 1.0
 -- Logical wing-incidence limits.
 -- Negative = leading edges DOWN = confirmed anti-backflip direction.
 local MIN_COLLECTIVE = -20.0
-local MAX_COLLECTIVE =  12.0
+local MAX_COLLECTIVE =  14.0
 local MAX_DIFFERENTIAL = 10.0
 local MAX_RAW_ADAPTER = 30.0
 local TRIM = 0.0
 
--- Emergency anti-backflip mode.
-local BACKFLIP_PITCH_TRIGGER = 7.0
-local BACKFLIP_RATE_TRIGGER  = 12.0
-local BACKFLIP_COMMAND       = -20.0
-local BACKFLIP_RELEASE_PITCH = 2.0
-local BACKFLIP_RELEASE_RATE  = 2.0
+-- Pitch-priority hysteresis.
+-- Enter at a clearly bad attitude/rate, but do not leave until both are genuinely
+-- calm. This prevents the old adjust -> cancel -> adjust oscillation.
+local PRIORITY_ENTER_PITCH = 10.0 -- absolute degrees
+local PRIORITY_ENTER_RATE  = 16.0 -- absolute deg/s
+local PRIORITY_EXIT_PITCH  = 3.0
+local PRIORITY_EXIT_RATE   = 5.0
 
--- Nosedive recovery.
-local DIVE_PITCH_TRIGGER = -12.0
-local DIVE_RATE_TRIGGER  = -18.0
-local DIVE_COMMAND       = 10.0
+-- While pitch priority is active we still allow a little differential authority
+-- to keep a huge bank from developing, but heading recovery is suppressed.
+local PRIORITY_MAX_DIFFERENTIAL = 3.0
+
+-- Pitch/roll rates are derived from attitude samples. Smooth them because CC tick
+-- timing and Sable updates are not perfectly uniform.
+local RATE_FILTER_ALPHA = 0.28
 
 local LOOP_DT = 0.05
 local MIN_DETECT_SPEED = 0.35
@@ -75,6 +85,15 @@ local function clamp(v, lo, hi)
     if v < lo then return lo end
     if v > hi then return hi end
     return v
+end
+
+local function lerp(a,b,t)
+    return a + (b-a)*t
+end
+
+local function smoothstep01(t)
+    t=clamp(t,0,1)
+    return t*t*(3-2*t)
 end
 
 local function vec(x,y,z) return {x=x,y=y,z=z} end
@@ -154,18 +173,19 @@ local function setRaw(l,r)
     right.setTargetAngle(r)
 end
 
-local function setControls(collective,differential)
+local function setControls(collective,differential,maxDifferential)
     collective=clamp(collective,MIN_COLLECTIVE,MAX_COLLECTIVE)
-    differential=clamp(differential,-MAX_DIFFERENTIAL,MAX_DIFFERENTIAL)
+    local diffLimit=maxDifferential or MAX_DIFFERENTIAL
+    differential=clamp(differential,-diffLimit,diffLimit)
 
     local rawLeft  = -(collective + differential)
     local rawRight =  (collective - differential)
     setRaw(rawLeft,rawRight)
-    return rawLeft,rawRight
+    return rawLeft,rawRight,differential
 end
 
--- Find which LOCAL horizontal axis is the physical nose. We only need to discover
--- this once. Afterward qrotate() continuously maps that body axis into WORLD space.
+-- Find which LOCAL horizontal axis is the physical nose. The local nose axis is
+-- fixed by construction; its WORLD direction is recomputed every single tick.
 local function detectForward()
     term.clear(); term.setCursorPos(1,1)
     print("UAV stabilizer")
@@ -197,8 +217,6 @@ local function horizontal(v)
     return norm(vec(v.x,0,v.z))
 end
 
--- Signed horizontal angle from CURRENT nose direction to TARGET nose direction.
--- Positive/negative sign directly maps to opposite bank requests.
 local function headingError(currentForward,targetForward)
     local c=horizontal(currentForward)
     local t=horizontal(targetForward)
@@ -213,8 +231,7 @@ local function headingDeg(forwardWorld)
 end
 
 local function attitude(q,forwardLocal)
-    -- THIS is the dynamic forward update: the body nose axis is transformed by the
-    -- latest Sable orientation every single loop.
+    -- Dynamic WORLD forward direction: updated from Sable on every loop.
     local forwardWorld=qrotate(q,forwardLocal)
     local upWorld=qrotate(q,vec(0,1,0))
 
@@ -233,79 +250,90 @@ end
 local function main()
     local forwardLocal,forwardLabel=detectForward()
 
-    -- Capture only the desired HORIZONTAL heading. Pitch/roll targets remain world level.
+    -- Capture only horizontal heading; level remains absolute world level.
     local q0=getOrientation()
     local targetForward=horizontal(qrotate(q0,forwardLocal))
     assert(len(targetForward)>1e-6,"Cannot establish heading while nose is vertical")
 
-    local prevPitch,prevRoll=0,0
-    local first=true
-    local emergency=false
+    local prevPitch,prevRoll=nil,nil
+    local filtPitchRate,filtRollRate=0,0
+    local pitchPriority=false
     local nextTelemetry=os.clock()
+    local lastSample=os.clock()
 
     while true do
+        local now=os.clock()
+        local dt=now-lastSample
+        lastSample=now
+        if dt < 0.01 or dt > 0.25 then dt=LOOP_DT end
+
         local q=getOrientation()
         local pitch,roll,upY,currentForward=attitude(q,forwardLocal)
         local yawErr=headingError(currentForward,targetForward)
 
-        local pitchRate,rollRate=0,0
-        if not first then
-            pitchRate=(pitch-prevPitch)/LOOP_DT
-            rollRate=(roll-prevRoll)/LOOP_DT
+        local rawPitchRate,rawRollRate=0,0
+        if prevPitch~=nil then
+            rawPitchRate=(pitch-prevPitch)/dt
+            rawRollRate=(roll-prevRoll)/dt
         end
-        first=false
         prevPitch,prevRoll=pitch,roll
 
-        local desiredRoll=0
-        if math.abs(yawErr) > HEADING_DEADBAND then
-            desiredRoll=clamp(HEADING_TO_BANK*yawErr,-MAX_BANK_TARGET,MAX_BANK_TARGET)
-        end
+        filtPitchRate=filtPitchRate + RATE_FILTER_ALPHA*(rawPitchRate-filtPitchRate)
+        filtRollRate=filtRollRate + RATE_FILTER_ALPHA*(rawRollRate-filtRollRate)
 
-        local mode="NORMAL"
-        local collective
-        local differential
+        local absPitch=math.abs(pitch)
+        local absPitchRate=math.abs(filtPitchRate)
 
-        if not emergency and (pitch >= BACKFLIP_PITCH_TRIGGER or pitchRate >= BACKFLIP_RATE_TRIGGER) then
-            emergency=true
-        elseif emergency and pitch <= BACKFLIP_RELEASE_PITCH and pitchRate <= BACKFLIP_RELEASE_RATE and upY > 0.25 then
-            emergency=false
-        end
-
-        if emergency then
-            mode="ANTI-BACKFLIP"
-            collective=BACKFLIP_COMMAND
-            differential=0 -- first survive the pitch runaway
-        elseif pitch <= DIVE_PITCH_TRIGGER or pitchRate <= DIVE_RATE_TRIGGER then
-            mode="DIVE RECOVERY"
-            collective=DIVE_COMMAND
-            differential=0
+        -- Hysteresis: one stable decision, not a threshold that chatters every tick.
+        if not pitchPriority then
+            if absPitch >= PRIORITY_ENTER_PITCH or absPitchRate >= PRIORITY_ENTER_RATE then
+                pitchPriority=true
+            end
         else
-            collective=TRIM-PITCH_KP*pitch-PITCH_KD*pitchRate
-
-            -- Yaw/heading control through DIFFERENTIAL front-wing incidence:
-            -- yaw error -> bank target -> differential incidence -> turn back to heading.
-            -- Once heading error goes away desiredRoll returns to 0, so it levels itself.
-            local rollError=roll-desiredRoll
-            differential=ROLL_SIGN*(-ROLL_KP*rollError-ROLL_KD*rollRate)
-
-            if math.abs(yawErr) > HEADING_DEADBAND then
-                mode="HEADING RECOVERY"
+            if absPitch <= PRIORITY_EXIT_PITCH and absPitchRate <= PRIORITY_EXIT_RATE and upY > 0.35 then
+                pitchPriority=false
             end
         end
 
-        local rawLeft,rawRight=setControls(collective,differential)
+        -- Continuous gain scheduling. Severe error gets strong authority, but the
+        -- command automatically fades as the nose approaches level.
+        local severity=smoothstep01(absPitch/FULL_PITCH_GAIN_AT)
+        local pitchKp=lerp(PITCH_KP_MIN,PITCH_KP_MAX,severity)
+        local pitchKd=lerp(PITCH_KD_MIN,PITCH_KD_MAX,severity)
+        local collective=TRIM - pitchKp*pitch - pitchKd*filtPitchRate
+        collective=clamp(collective,MIN_COLLECTIVE,MAX_COLLECTIVE)
+
+        local desiredRoll=0
+        local mode="NORMAL"
+
+        if pitchPriority then
+            -- Do not chase heading while diving/backflipping. First recover the
+            -- longitudinal attitude. We still try to stop a large roll.
+            mode = pitch >= 0 and "PITCH RECOVERY UP" or "PITCH RECOVERY DOWN"
+            desiredRoll=0
+        elseif math.abs(yawErr) > HEADING_DEADBAND then
+            mode="HEADING RECOVERY"
+            desiredRoll=clamp(HEADING_TO_BANK*yawErr,-MAX_BANK_TARGET,MAX_BANK_TARGET)
+        end
+
+        local rollError=roll-desiredRoll
+        local differential=ROLL_SIGN*(-ROLL_KP*rollError-ROLL_KD*filtRollRate)
+
+        local diffLimit=pitchPriority and PRIORITY_MAX_DIFFERENTIAL or MAX_DIFFERENTIAL
+        local rawLeft,rawRight,usedDifferential=setControls(collective,differential,diffLimit)
 
         if os.clock() >= nextTelemetry then
             nextTelemetry=os.clock()+TELEMETRY_PERIOD
             term.clear(); term.setCursorPos(1,1)
-            print("UAV LEVEL + HEADING HOLD")
+            print("UAV CONTINUOUS ATTITUDE HOLD")
             print("MODE: "..mode)
-            print("Body nose axis: "..forwardLabel)
-            print(string.format("Heading %6.1f  err %6.1f",headingDeg(currentForward),yawErr))
-            print(string.format("Pitch   %6.1f  rate %7.1f",pitch,pitchRate))
-            print(string.format("Roll    %6.1f  target %5.1f",roll,desiredRoll))
-            print(string.format("Collective %6.1f",collective))
-            print(string.format("Differential %5.1f",differential))
+            print("Body nose: "..forwardLabel)
+            print(string.format("Heading %6.1f err %6.1f",headingDeg(currentForward),yawErr))
+            print(string.format("Pitch %7.2f rate %7.2f",pitch,filtPitchRate))
+            print(string.format("Roll  %7.2f target %6.1f",roll,desiredRoll))
+            print(string.format("Severity %.2f  priority %s",severity,pitchPriority and "YES" or "no"))
+            print(string.format("Collective %7.2f",collective))
+            print(string.format("Differential %5.2f",usedDifferential))
             print(string.format("Raw L/R %6.1f / %6.1f",rawLeft,rawRight))
             print("")
             print("Ctrl+T = stop + neutral")
