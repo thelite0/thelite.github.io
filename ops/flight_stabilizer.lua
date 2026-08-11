@@ -1,4 +1,4 @@
--- Crystalite UAV attitude stabilizer prototype
+-- Crystalite UAV world-level attitude stabilizer prototype
 -- CC:Sable + Create Propulsion Tilt Adapters
 --
 -- tilt_adapter_1 = front LEFT
@@ -7,10 +7,11 @@
 --   positive logical incidence = leading/front edge UP, trailing/rear edge DOWN
 --   left raw adapter angle must be inverted, right raw adapter angle is normal.
 --
--- Start this while the aircraft is sitting in the attitude you want it to hold.
--- It captures that pose as "straight", waits until the aircraft is moving enough
--- to detect which local horizontal axis is the nose direction, then stabilizes
--- pitch + roll. It does NOT actively control yaw/heading.
+-- IMPORTANT: "straight" is WORLD LEVEL now.
+-- Startup attitude is NOT captured as the target.
+-- Target pitch = 0 degrees relative to world horizontal.
+-- Target roll  = 0 degrees relative to world up.
+-- Yaw/heading is intentionally left free.
 
 local LEFT_NAME  = "tilt_adapter_1"
 local RIGHT_NAME = "tilt_adapter_2"
@@ -101,9 +102,9 @@ local function qrotate(q, v)
     return vec(r.x, r.y, r.z)
 end
 
--- CC:Sable 1.3.4 in this pack returns orientation as axis-angle:
+-- Installed CC:Sable returns orientation as axis-angle:
 --   { a = angleRadians, v = { axisX, axisY, axisZ } }
--- Newer source revisions may return {x,y,z,w} directly, so support both.
+-- Support quaternion format too in case the API changes.
 local function tableXYZ(t)
     assert(type(t) == "table", "Expected vector table")
 
@@ -124,18 +125,15 @@ end
 local function orientationToQuaternion(o)
     assert(type(o) == "table", "Sable orientation is not a table")
 
-    -- Quaternion format.
     if type(o.x) == "number" and type(o.y) == "number" and
        type(o.z) == "number" and type(o.w) == "number" then
         return qnorm({x=o.x, y=o.y, z=o.z, w=o.w})
     end
 
-    -- Axis-angle format observed in the installed CC:Sable build.
     if type(o.a) == "number" and type(o.v) == "table" then
         local ax, ay, az = tableXYZ(o.v)
         local axisLen = math.sqrt(ax*ax + ay*ay + az*az)
 
-        -- Identity rotation can legally have an arbitrary/zero axis.
         if axisLen < 1e-9 then
             if math.abs(o.a) < 1e-9 then
                 return {x=0, y=0, z=0, w=1}
@@ -159,6 +157,7 @@ local function orientationToQuaternion(o)
 end
 
 local RAD2DEG = 180 / math.pi
+local WORLD_UP = vec(0, 1, 0)
 
 local function setRaw(leftAngle, rightAngle)
     leftAngle = clamp(leftAngle, -MAX_RAW_ADAPTER, MAX_RAW_ADAPTER)
@@ -171,9 +170,8 @@ local function setControls(collective, differential)
     collective = clamp(collective, -MAX_COLLECTIVE, MAX_COLLECTIVE)
     differential = clamp(differential, -MAX_DIFFERENTIAL, MAX_DIFFERENTIAL)
 
-    -- Physical incidence:
-    --   left  = collective + differential
-    --   right = collective - differential
+    -- Logical physical incidence:
+    --   positive collective = BOTH leading edges up.
     -- Raw adapter signs are mirrored on the airframe.
     local rawLeft  = -(collective + differential)
     local rawRight =  (collective - differential)
@@ -194,23 +192,27 @@ local function getVelocity()
     return vec(v.x, v.y, v.z)
 end
 
-local function detectForward(qRef)
+local function detectForward()
     term.clear()
     term.setCursorPos(1, 1)
     print("UAV stabilizer")
-    print("Target attitude captured.")
+    print("Target: WORLD LEVEL")
+    print("Pitch target: 0 deg")
+    print("Roll target : 0 deg")
     print("Waiting for forward movement...")
-    print("Keep aircraft pointed straight.")
 
     while true do
         setControls(TRIM, 0)
 
+        local qNow = getOrientation()
         local vWorld = getVelocity()
-        -- Convert world velocity into the captured reference/body frame.
-        local vLocal = qrotate(qconj(qRef), vWorld)
-        local horizontal = math.sqrt(vLocal.x*vLocal.x + vLocal.z*vLocal.z)
 
-        if horizontal >= MIN_DETECT_SPEED then
+        -- Convert velocity into the aircraft's CURRENT body frame.
+        -- This does not assume startup attitude was straight.
+        local vLocal = qrotate(qconj(qNow), vWorld)
+        local bodyHorizontal = math.sqrt(vLocal.x*vLocal.x + vLocal.z*vLocal.z)
+
+        if bodyHorizontal >= MIN_DETECT_SPEED then
             if math.abs(vLocal.x) >= math.abs(vLocal.z) then
                 local s = vLocal.x >= 0 and 1 or -1
                 return vec(s, 0, 0), "X" .. (s > 0 and "+" or "-")
@@ -224,12 +226,39 @@ local function detectForward(qRef)
     end
 end
 
-local function main()
-    -- The exact attitude at startup becomes the target attitude.
-    local qRef = getOrientation()
-    local forwardLocal, forwardLabel = detectForward(qRef)
+local function getWorldLevelAttitude(qNow, forwardLocal)
     local upLocal = vec(0, 1, 0)
-    local rightLocal = normalize(cross(forwardLocal, upLocal))
+    local forwardWorld = qrotate(qNow, forwardLocal)
+    local upWorld = qrotate(qNow, upLocal)
+
+    -- Pitch is simply nose elevation above/below the WORLD horizon.
+    local horizontalLength = math.sqrt(
+        forwardWorld.x*forwardWorld.x + forwardWorld.z*forwardWorld.z
+    )
+    local pitch = math.atan(forwardWorld.y, horizontalLength) * RAD2DEG
+
+    -- Roll is measured against WORLD vertical while preserving whatever yaw
+    -- heading the aircraft currently has.
+    local forwardHorizontal = normalize(vec(forwardWorld.x, 0, forwardWorld.z))
+    local rightHorizontal
+
+    if length(forwardHorizontal) < 1e-6 then
+        -- Near a vertical nose attitude yaw is undefined; pick a harmless axis.
+        rightHorizontal = vec(1, 0, 0)
+    else
+        rightHorizontal = normalize(cross(forwardHorizontal, WORLD_UP))
+    end
+
+    local roll = math.atan(
+        dot(upWorld, rightHorizontal),
+        dot(upWorld, WORLD_UP)
+    ) * RAD2DEG
+
+    return pitch, roll
+end
+
+local function main()
+    local forwardLocal, forwardLabel = detectForward()
 
     local previousPitch = 0
     local previousRoll = 0
@@ -238,22 +267,7 @@ local function main()
 
     while true do
         local qNow = getOrientation()
-
-        -- Orientation difference in the captured reference/body frame.
-        local qRel = qnorm(qmul(qconj(qRef), qNow))
-
-        local currentForward = qrotate(qRel, forwardLocal)
-        local currentUp = qrotate(qRel, upLocal)
-
-        -- Positive pitch = nose above captured target attitude.
-        local forwardAlongTarget = dot(currentForward, forwardLocal)
-        local pitch = math.atan(currentForward.y, forwardAlongTarget) * RAD2DEG
-
-        -- Positive roll = aircraft banked toward reference-frame right.
-        local roll = math.atan(
-            dot(currentUp, rightLocal),
-            dot(currentUp, upLocal)
-        ) * RAD2DEG
+        local pitch, roll = getWorldLevelAttitude(qNow, forwardLocal)
 
         local pitchRate = 0
         local rollRate = 0
@@ -265,11 +279,10 @@ local function main()
         previousPitch = pitch
         previousRoll = roll
 
-        -- Front wings are ahead of CoM on this testbed:
-        -- more positive collective incidence produced nose-up authority in testing.
+        -- WORLD-LEVEL target is always pitch=0, roll=0.
+        -- Negative pitch (nosedive) therefore commands positive collective incidence.
         local collective = TRIM - PITCH_KP*pitch - PITCH_KD*pitchRate
 
-        -- Differential incidence provides roll authority.
         local differential = ROLL_SIGN * (-ROLL_KP*roll - ROLL_KD*rollRate)
 
         collective = clamp(collective, -MAX_COLLECTIVE, MAX_COLLECTIVE)
@@ -281,7 +294,8 @@ local function main()
             nextTelemetry = os.clock() + TELEMETRY_PERIOD
             term.clear()
             term.setCursorPos(1, 1)
-            print("UAV ATTITUDE HOLD - ACTIVE")
+            print("UAV WORLD-LEVEL HOLD - ACTIVE")
+            print("Target pitch/roll: 0 / 0 deg")
             print("Forward axis: " .. forwardLabel)
             print(string.format("Pitch: %7.2f deg  rate: %7.2f", pitch, pitchRate))
             print(string.format("Roll : %7.2f deg  rate: %7.2f", roll, rollRate))
